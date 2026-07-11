@@ -1,0 +1,120 @@
+========================================
+        VOICE TO TEXT
+   How to Set It Up  -  Easy Steps
+========================================
+
+
+WHAT DOES THIS DO?
+
+You talk, and the computer writes down your words.
+That is all. It is easy.
+
+
+
+SETTING IT UP  (you only do this one time)
+
+
+STEP 1
+Put these things in the same place (like the Desktop):
+
+   - build.bat
+   - voice_simple_win.py
+   - voicetotext.ico
+
+They came together in the same folder. Keep them together.
+
+
+STEP 2
+Find the file called   build.bat
+Double-click it.  (Click it two times, fast.)
+
+A black window will pop up. That is normal. Do not worry.
+
+
+STEP 3
+If the black window says you need "Python":
+
+   - A website will open by itself.
+   - Click the big yellow "Download" button.
+   - Open the file it downloads.
+   - VERY IMPORTANT:  On the first screen, look at the
+     bottom. There is a little box that says
+     "Add Python to PATH".
+     CLICK that little box so it has a checkmark.
+   - Then click "Install Now".
+   - Wait for it to finish. Click Close.
+   - Now double-click  build.bat  again.
+
+If it did NOT ask for Python, good! Skip this step.
+
+
+STEP 4
+Wait a few minutes. The black window is working.
+When it is done, it will say "All done!"
+
+A new picture (a green microphone) appears on the Desktop.
+It is called "Voice to Text".
+
+
+STEP 5
+Double-click the green microphone.
+The app opens.
+
+
+STEP 6  (one time only)
+Look at the top-right corner. There is a tiny gear picture.
+Click it.
+
+A box opens. There is a line to type in a "key".
+Paste the key that Konrad gives you.
+Click the green "Save" button.
+
+You are finished! Now you can use it.
+
+
+
+HOW TO USE IT EVERY DAY
+
+1. Double-click the green microphone on the Desktop.
+
+2. Click the big GREEN button. It turns RED.
+
+3. Talk. Say anything you want.
+
+4. Click the big RED button when you are done.
+
+5. A little spinning wheel shows it is working. Wait.
+
+6. Then it says: "Click where the words should go..."
+   You have 5 seconds. Click inside your email or
+   document - wherever you want the words.
+
+7. The words type themselves there. Like magic!
+
+   (Your words also stay in the app window,
+    so you can copy them again any time.)
+
+
+THE OTHER BUTTONS
+
+   COPY        - keeps your words so you can put them
+                 in an email or somewhere else.
+
+   READ ALOUD  - the computer reads your words back to you.
+
+   START OVER  - clears the screen so you can begin again.
+
+
+
+IF SOMETHING IS WRONG
+
+Take a photo of the screen and send it to Konrad.
+He will help.
+
+
+
+TO REMOVE THE APP LATER
+
+Open the app, click the tiny gear at the top-right,
+and click the "Remove this app" button at the bottom.
+It will clean everything up for you.

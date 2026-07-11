@@ -1,0 +1,91 @@
+========================================
+  Building VoiceToText.exe with GitHub
+  (No install, no command line - just clicking)
+========================================
+
+You already have a GitHub account. Here is exactly what to click.
+
+
+STEP 1 — Create a new repository
+---------------------------------
+1. Go to  https://github.com/new
+2. Repository name:  voicetotext
+3. Set it to "Private" (so only you can see it) — either is fine,
+   but Private keeps your Groq key habits private too.
+4. Do NOT tick "Add a README" — leave everything else unticked.
+5. Click the green "Create repository" button.
+
+
+STEP 2 — Upload the files
+---------------------------------
+1. On the new (empty) repository page, look for a link that says
+   "uploading an existing file" — click it.
+   (If you don't see it, click "Add file" -> "Upload files")
+
+2. Unzip  github_upload.zip  on your computer first, so you have
+   a folder containing:
+       - voice_simple_win.py
+       - voicetotext.ico
+       - READ ME FIRST.txt
+       - a folder called  .github  (with build.yml inside it)
+
+3. Drag the WHOLE folder's contents into the GitHub upload box.
+   IMPORTANT: make sure the .github folder comes along too — on
+   most computers drag-and-drop keeps folders intact automatically.
+
+   If GitHub's uploader does not accept folders (only loose files),
+   use the "GitHub Desktop" app instead — see the note at the
+   bottom of this file.
+
+4. Scroll down, click the green "Commit changes" button.
+
+
+STEP 3 — Watch it build
+---------------------------------
+1. Click the "Actions" tab near the top of the repository page.
+2. You'll see "Build Windows App" running with a small yellow dot.
+3. Wait 2-5 minutes. The dot turns into a green checkmark when done.
+
+   (If it turns into a red X, click on it to see what went wrong,
+    and send Konrad a screenshot.)
+
+
+STEP 4 — Download the .exe
+---------------------------------
+1. Click on the finished build (the one with the green checkmark).
+2. Scroll down to a section called "Artifacts".
+3. Click "VoiceToText-Windows" to download it.
+4. This downloads a ZIP file — open it, and inside is
+   VoiceToText.exe
+
+5. Move VoiceToText.exe to the Desktop (or wherever you like).
+6. Double-click it to run. That's it — no install needed!
+
+
+FUTURE UPDATES
+---------------------------------
+Whenever Konrad gives you a new voice_simple_win.py file:
+  1. Go back to your repository on GitHub
+  2. Click on voice_simple_win.py, then the pencil (edit) icon,
+     or just delete the old one and upload the new one
+  3. Commit the change
+  4. It rebuilds automatically — go to Actions, wait, download
+     the new .exe the same way as Step 4.
+
+
+IF DRAG-AND-DROP DOESN'T KEEP THE .github FOLDER
+---------------------------------
+GitHub's website uploader sometimes only accepts individual files,
+not folders. If the .github folder gets left out, the build won't
+run. In that case:
+
+  1. On the repository page, click "Add file" -> "Create new file"
+  2. In the "Name your file" box, type exactly:
+        .github/workflows/build.yml
+     (GitHub automatically creates the folders when you type the
+      slashes like that)
+  3. Open the build.yml file Konrad gave you in a text editor,
+     copy all its contents, and paste them into the big text box
+  4. Click "Commit changes"
+  5. Then upload the other 3 files (voice_simple_win.py,
+     voicetotext.ico, READ ME FIRST.txt) normally
