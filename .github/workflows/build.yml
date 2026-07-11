@@ -1,0 +1,38 @@
+name: Build Windows App
+
+# This runs automatically every time you upload new files,
+# and also lets you trigger it manually with a button.
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # This line is the important part: it runs on a real Windows computer
+    # provided free by GitHub, just for the few minutes the build takes.
+    runs-on: windows-latest
+
+    steps:
+      - name: Get the files
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the pieces the app needs
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller groq requests pyttsx3 pyautogui pyaudio
+
+      - name: Build VoiceToText.exe
+        run: |
+          pyinstaller --onefile --noconsole --name "VoiceToText" --icon voicetotext.ico voice_simple_win.py
+
+      - name: Make it downloadable
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceToText-Windows
+          path: dist/VoiceToText.exe
