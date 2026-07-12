@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -201,6 +201,7 @@ DEFAULT_CONFIG = {
     "show_read":         True,
     "show_clear":        True,
     "auto_type":         True,   # type the words where the cursor is
+    "type_delay":        5,      # seconds to wait before typing (3-15)
     "speech_rate":       165,   # words per minute for read-aloud
 }
 
@@ -627,11 +628,12 @@ class RoundButton(tk.Canvas):
 
         # Icon centered in the upper-middle, label below it — both as one
         # visually balanced unit, vertically centered as a group within
-        # the button (this replaces the old single centered text glyph).
+        # the button. A generous gap keeps the icon and label from looking
+        # squished together.
         icon_r = s * 0.13
         font_size = max(9, int(s * 0.082))
-        label_h = font_size * 2.5   # reserve room for up to 2 wrapped lines
-        gap = s * 0.06
+        label_h = font_size * 2.3   # reserve room for up to 2 wrapped lines
+        gap = s * 0.16              # clear breathing room between icon and label
         group_h = icon_r*2 + gap + label_h
         top = s/2 - group_h/2
         icon_cy = top + icon_r
@@ -850,6 +852,27 @@ class SettingsWindow(tk.Toplevel):
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
+        # ── Connection test ────────────────────────────────────────────────
+        tk.Label(body, text="Internet Connection", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="If recordings keep failing, a VPN can sometimes block "
+                      "the connection. Test it here.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED,
+                 justify="left", wraplength=win_w-60).pack(anchor="w", padx=20)
+
+        self.conn_test_btn = tk.Button(body, text="Test Connection",
+                                       font=ui_font(10, bold=True),
+                                       bg=C_BLUE, fg="white", padx=10, pady=4,
+                                       command=self._test_connection)
+        self.conn_test_btn.pack(anchor="w", padx=20, pady=6)
+        self.conn_status_lbl = tk.Label(body, text="", font=ui_font(9),
+                                        bg=C_BG, fg=C_MUTED, justify="left",
+                                        wraplength=win_w-60)
+        self.conn_status_lbl.pack(anchor="w", padx=20)
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
         tk.Label(body, text="Which buttons should show?",
                  font=ui_font(12, bold=True), bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
         tk.Label(body, text="The Record button always stays.",
@@ -870,9 +893,25 @@ class SettingsWindow(tk.Toplevel):
         tk.Checkbutton(body, text="Type the words where I click (after recording)",
                        variable=self.autotype_var, bg=C_BG,
                        font=ui_font(11)).pack(anchor="w", padx=20, pady=2)
-        tk.Label(body, text="After it finishes, you get 5 seconds to click where\nthe words should go, then they type themselves.",
+        tk.Label(body, text="After it finishes, you get a few seconds to click\nwhere the words should go, then they type themselves.",
                  font=ui_font(9), bg=C_BG, fg=C_MUTED,
-                 justify="left").pack(anchor="w", padx=30, pady=(0, 16))
+                 justify="left").pack(anchor="w", padx=30, pady=(0, 8))
+
+        delay_row = tk.Frame(body, bg=C_BG)
+        delay_row.pack(anchor="w", padx=30, pady=(0, 16), fill="x")
+        tk.Label(delay_row, text="Wait time:", font=ui_font(10),
+                bg=C_BG, fg=C_TEXT).pack(side="left")
+        self.delay_var = tk.IntVar(value=int(cfg.get("type_delay", 5)))
+        self.delay_value_lbl = tk.Label(delay_row, text=f"{self.delay_var.get()} sec",
+                                        font=ui_font(10, bold=True), bg=C_BG, fg=C_BLUE)
+        self.delay_value_lbl.pack(side="right")
+        delay_scale = tk.Scale(body, from_=3, to=15, orient="horizontal",
+                               variable=self.delay_var, bg=C_BG, fg=C_TEXT,
+                               troughcolor=C_BORDER, highlightthickness=0,
+                               showvalue=False, length=win_w-70,
+                               command=lambda v: self.delay_value_lbl.config(
+                                   text=f"{int(float(v))} sec"))
+        delay_scale.pack(anchor="w", padx=30, pady=(0, 16))
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
@@ -944,6 +983,48 @@ class SettingsWindow(tk.Toplevel):
             os.startfile("ms-settings:privacy-microphone")
         except Exception as e:
             log_error("open_mic_privacy", e)
+
+    def _test_connection(self):
+        """Send a tiny request to Groq to check whether something (usually a
+        VPN) is blocking it, without needing to record anything first."""
+        log_event("BUTTON", "Test Connection clicked")
+        self.conn_test_btn.config(state="disabled", text="Testing...")
+        self.conn_status_lbl.config(text="Checking...", fg=C_BLUE)
+
+        def work():
+            key = self.cfg.get("groq_api_key", "")
+            if not key:
+                result = ("no_key", "Add your Groq key above first, then test.")
+            else:
+                try:
+                    r = requests.get("https://api.groq.com/openai/v1/models",
+                                     headers={"Authorization": f"Bearer {key}"},
+                                     timeout=10)
+                    if r.status_code == 200:
+                        result = ("ok", "Connected! The app can reach Groq normally.")
+                    elif r.status_code == 403:
+                        result = ("blocked",
+                                  "Blocked (error 403). This is almost always a "
+                                  "VPN or network filter. Try turning off any "
+                                  "VPN and test again.")
+                    elif r.status_code == 401:
+                        result = ("badkey", "The Groq key was rejected — check it's correct.")
+                    else:
+                        result = ("other", f"Got an unexpected response (code {r.status_code}).")
+                except requests.exceptions.Timeout:
+                    result = ("timeout", "No response — check the internet connection.")
+                except Exception as e:
+                    result = ("error", f"Couldn't connect: {e}")
+            log_event("CONN_TEST", f"result: {result[0]}")
+            self.after(0, lambda: self._show_conn_result(result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_conn_result(self, result):
+        kind, msg = result
+        self.conn_test_btn.config(state="normal", text="Test Connection")
+        colour = C_GREEN if kind == "ok" else (C_RED if kind in ("blocked","error") else C_MUTED)
+        self.conn_status_lbl.config(text=msg, fg=colour)
 
     def _test_microphone(self):
         """Record 3 seconds and show a live level meter, so it's obvious
@@ -1055,11 +1136,32 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["show_read"]  = self.read_var.get()
         self.cfg["show_clear"] = self.clear_var.get()
         self.cfg["auto_type"]  = self.autotype_var.get()
+        self.cfg["type_delay"] = int(self.delay_var.get())
         save_config(self.cfg)
         self.on_save()
         self.destroy()
 
 # ─── Main window ──────────────────────────────────────────────────────────────
+def classify_api_error(exc):
+    """
+    Turn a raw exception from Groq into a plain-language, actionable message.
+    A 403 'access denied' is Groq blocking the request before it even reaches
+    the account — almost always a VPN or network filter, NOT a bad key or
+    silence. A 401 means the key itself is wrong. Anything else falls back
+    to a generic network message.
+    """
+    s = str(exc).lower()
+    if "403" in s or "access denied" in s or "permissiondenied" in s.lower():
+        return ("It looks like a VPN or network is blocking the connection. "
+                "If a VPN is running, try turning it off, or ask about "
+                "allowing this app through it.")
+    if "401" in s or "invalid api key" in s or "authentication" in s:
+        return "There may be a problem with the Groq key (check the gear)."
+    if "timeout" in s or "connection" in s or "network" in s:
+        return "Couldn't reach the internet — check the connection and try again."
+    return None
+
+
 class SimpleApp:
     def __init__(self, root):
         log_event("APP", f"started — version {APP_VERSION}, platform {sys.platform}")
@@ -1091,12 +1193,12 @@ class SimpleApp:
         avail_w = screen_w - 80
         win_w = min(720, avail_w)
         win_h = min(820, avail_h)
-        win_w = max(win_w, 420)
+        win_w = max(win_w, 460)
         win_h = max(win_h, 480)
         x = (screen_w - win_w) // 2
         y = max(20, (screen_h - win_h) // 2)
         root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        root.minsize(360, 420)
+        root.minsize(460, 420)
         self._full_height = win_h
 
         # Outer frame lets us guarantee the button row a spot at the very
@@ -1181,12 +1283,11 @@ class SimpleApp:
             return  # window not really laid out yet
 
         n = len(self._buttons)
-        cols = 1 if n == 1 else 2
-        rows = (n + cols - 1) // cols
-        gap = 16
+        gap = 14
 
+        # Single row: all buttons share the window's width.
         avail_w = win_w - 48
-        max_w = (avail_w - (cols-1)*gap) / cols
+        max_w = (avail_w - (n-1)*gap) / n
 
         if self._compact:
             # In compact mode the buttons ARE the window, so let them use
@@ -1196,9 +1297,11 @@ class SimpleApp:
             # Leave most of the height for the text area, but don't starve
             # the buttons on ordinary laptop screens.
             avail_h = win_h * 0.48
-        max_h = (avail_h - (rows-1)*gap) / rows
 
-        new_size = int(max(120, min(210, max_w, max_h)))
+        # A single row can only grow as tall as one button, so height is
+        # rarely the limiting factor here — width usually is once there
+        # are 3-4 buttons side by side.
+        new_size = int(max(90, min(210, max_w, avail_h)))
         self._btn_size_current = new_size
 
         for _, btn in self._buttons:
@@ -1222,14 +1325,14 @@ class SimpleApp:
                     self._outer.winfo_children()[1].winfo_reqheight() + 40
             win_w = self.root.winfo_width()
             self.root.geometry(f"{win_w}x{max(220, new_h)}")
-            self.root.minsize(300, 200)
+            self.root.minsize(460, 180)
         else:
             self.status_row.pack(side="top", pady=8)
             self.text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
             self.compact_btn.config(text="Compact view")
             win_w = self.root.winfo_width()
             self.root.geometry(f"{win_w}x{self._full_height or 700}")
-            self.root.minsize(360, 420)
+            self.root.minsize(460, 420)
         self.root.after(150, self._apply_responsive_size)
 
     # ── Buttons ───────────────────────────────────────────────────────────────
@@ -1246,12 +1349,12 @@ class SimpleApp:
         if self.cfg.get("show_clear", True):
             specs.append(("clear", "clear", "START OVER", C_GREY, C_GREY_H, self._on_clear))
 
-        cols = 1 if len(specs) == 1 else 2
+        # All buttons sit in a single horizontal line rather than a grid —
+        # cleaner and easier to scan at a glance.
         size = getattr(self, "_btn_size_current", 190)
         for i, (key, icon, label, colour, hover, cmd) in enumerate(specs):
             btn = RoundButton(self.btn_frame, icon, label, colour, hover, cmd, size=size)
-            r, c = divmod(i, cols)
-            btn.grid(row=r, column=c, padx=8, pady=8)
+            btn.grid(row=0, column=i, padx=10, pady=8)
             self._buttons.append((key, btn))
             if key == "record":
                 self.record_btn = btn
@@ -1321,6 +1424,14 @@ class SimpleApp:
         self._seg_lock = threading.Lock()
         self._seg_index = 0
         self._seg_cut = 0          # frame position where the next segment starts
+        self._seg_errors = []      # exceptions from failed segment transcriptions
+        # Dedicated lock guarding _seg_cut itself. Without this, the
+        # background segmenter and the final "leftover" cut in _process can
+        # both read the same stale cut point at once and each transcribe the
+        # same stretch of audio — the cause of words randomly appearing
+        # twice in the output. Every read-then-update of _seg_cut must go
+        # through this lock as one atomic step.
+        self._seg_cut_lock = threading.Lock()
         threading.Thread(target=self._segmenter_loop, daemon=True).start()
 
     @safe_thread
@@ -1331,26 +1442,37 @@ class SimpleApp:
         max_seg = int(fps * 18)                   # force a cut by ~18s
         while self._recording:
             time.sleep(0.4)
-            n = self.recorder.frame_count()
-            grown = n - self._seg_cut
-            if grown < min_seg:
-                continue
-            # Cut at a natural pause, or force a cut if the segment is long
-            if self.recorder.recent_is_pause() or grown >= max_seg:
-                self._launch_segment(self._seg_cut, n)
-                self._seg_cut = n
+            with self._seg_cut_lock:
+                if not self._recording:
+                    break   # stopped while we were sleeping — don't cut
+                n = self.recorder.frame_count()
+                grown = n - self._seg_cut
+                if grown < min_seg:
+                    continue
+                # Cut at a natural pause, or force a cut if the segment is long
+                if self.recorder.recent_is_pause() or grown >= max_seg:
+                    self._launch_segment(self._seg_cut, n)
+                    self._seg_cut = n
 
     def _launch_segment(self, start, end):
         idx = self._seg_index
         self._seg_index += 1
         raw = self.recorder.slice_bytes(start, end)
 
-        @safe_thread
         def work():
-            text = transcribe_bytes(raw, self.cfg,
-                                    self.cfg["sample_rate"], self.cfg["channels"])
-            with self._seg_lock:
-                self._seg_results[idx] = text
+            try:
+                text = transcribe_bytes(raw, self.cfg,
+                                        self.cfg["sample_rate"], self.cfg["channels"])
+                with self._seg_lock:
+                    self._seg_results[idx] = text
+            except Exception as e:
+                # Don't fail silently: a network/VPN block would otherwise
+                # just look like "no speech detected", which is misleading.
+                log_error(f"segment:{idx}", e)
+                log_event("TRANSCRIBE", f"segment {idx} failed: {type(e).__name__}: {e}")
+                with self._seg_lock:
+                    self._seg_results[idx] = ""
+                    self._seg_errors.append(e)
         t = threading.Thread(target=work, daemon=True)
         t.start()
         self._seg_threads.append(t)
@@ -1385,10 +1507,15 @@ class SimpleApp:
 
     def _process(self):
         try:
-            # Transcribe the final leftover segment (from last cut to the end)
-            total = self.recorder.frame_count()
-            if total > self._seg_cut:
-                self._launch_segment(self._seg_cut, total)
+            # Transcribe the final leftover segment (from last cut to the end).
+            # Guarded by the same lock as the background segmenter so the two
+            # can never grab overlapping audio ranges (that race was the
+            # cause of words occasionally appearing twice).
+            with self._seg_cut_lock:
+                total = self.recorder.frame_count()
+                if total > self._seg_cut:
+                    self._launch_segment(self._seg_cut, total)
+                    self._seg_cut = total
 
             # Wait for all segment transcriptions to finish
             for t in list(self._seg_threads):
@@ -1405,8 +1532,18 @@ class SimpleApp:
                                     f"{'...' if len(raw) > 80 else ''}\"")
 
             if not raw or is_probable_hallucination(raw):
-                log_event("TRANSCRIBE", "empty or hallucination-filtered — discarded")
-                self._set_status("I didn't catch any words — please try again", C_MUTED)
+                if self._seg_errors:
+                    # The segments didn't come back empty because of silence —
+                    # they failed. Give the real reason instead of implying
+                    # nothing was heard.
+                    msg = classify_api_error(self._seg_errors[0])
+                    log_event("TRANSCRIBE", f"all segments failed — {self._seg_errors[0]}")
+                    self._set_status(
+                        msg or "Couldn't reach Groq — please check your connection",
+                        C_RED)
+                else:
+                    log_event("TRANSCRIBE", "empty or hallucination-filtered — discarded")
+                    self._set_status("I didn't catch any words — please try again", C_MUTED)
                 return
 
             self._spin_start(C_PURPLE)
@@ -1432,18 +1569,18 @@ class SimpleApp:
         except Exception as e:
             log_error("_process", e)
             log_event("ERROR", f"_process failed: {type(e).__name__}: {e}")
-            msg = "Something went wrong — please try again"
-            if "api" in str(e).lower() or "key" in str(e).lower() or "401" in str(e):
-                msg = "There may be a problem with the Groq key (check the gear)"
-            self._set_status(msg, C_MUTED)
+            msg = classify_api_error(e) or "Something went wrong — please try again"
+            self._set_status(msg, C_RED if classify_api_error(e) else C_MUTED)
         finally:
             self._processing = False
             self._spin_stop()
 
     def _countdown_and_type(self, text):
-        """5-second countdown so the user can click where the words should go,
-        then the words type themselves at the cursor."""
-        for remaining in range(5, 0, -1):
+        """Countdown (configurable, 3-15s) so the user can click where the
+        words should go, then the words type themselves at the cursor."""
+        delay = int(self.cfg.get("type_delay", 5))
+        delay = max(3, min(15, delay))
+        for remaining in range(delay, 0, -1):
             self._set_status(
                 f"Click where the words should go...  typing in {remaining}",
                 C_BLUE)
