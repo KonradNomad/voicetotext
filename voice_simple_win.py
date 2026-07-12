@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.8.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -271,8 +271,8 @@ DEFAULT_CONFIG = {
     "show_clear":        True,
     "auto_type":         True,   # type the words where the cursor is
     "type_delay":        5,      # seconds to wait before typing (3-15)
-    "show_floating":      False,  # persistent floating record button
-    "floating_size":      64,     # diameter of the floating record button
+    "show_floating":      True,   # persistent floating record button (on by default)
+    "floating_size":      110,    # diameter of the floating record button
     "floating_x":         None,   # remembered position after dragging
     "floating_y":         None,
     "speech_rate":       165,   # words per minute for read-aloud
@@ -1089,11 +1089,11 @@ class SettingsWindow(tk.Toplevel):
         size_row.pack(anchor="w", padx=30, pady=(0, 4), fill="x")
         tk.Label(size_row, text="Button size:", font=ui_font(10),
                 bg=C_BG, fg=C_TEXT).pack(side="left")
-        self.floating_size_var = tk.IntVar(value=int(cfg.get("floating_size", 64)))
+        self.floating_size_var = tk.IntVar(value=int(cfg.get("floating_size", 110)))
         self.floating_size_lbl = tk.Label(size_row, text=f"{self.floating_size_var.get()} px",
                                           font=ui_font(10, bold=True), bg=C_BG, fg=C_BLUE)
         self.floating_size_lbl.pack(side="right")
-        floating_size_scale = tk.Scale(body, from_=40, to=110, orient="horizontal",
+        floating_size_scale = tk.Scale(body, from_=110, to=200, orient="horizontal",
                                variable=self.floating_size_var, bg=C_BG, fg=C_TEXT,
                                troughcolor=C_BORDER, highlightthickness=0,
                                showvalue=False, length=win_w-90,
@@ -1404,12 +1404,16 @@ class FloatingWidget(tk.Toplevel):
             pass
         self.configure(bg=C_BG)
 
-        size = int(app.cfg.get("floating_size", 64))
-        size = max(40, min(110, size))
-        close_size = max(28, int(size * 0.55))  # a real button, scaled to match
-        pad = 12
-        gap = 8
-        text_w = max(90, int(size * 1.7))
+        size = int(app.cfg.get("floating_size", 110))
+        size = max(110, min(200, size))
+        close_size = max(50, int(size * 0.55))  # a real button, scaled to match
+        pad = 14
+        gap = 10
+        text_w = max(140, int(size * 1.7))
+        # Status text scales with the button size too, so nothing looks
+        # cramped or gets cut off at any size in the 110-200 range — a
+        # fixed font size was the cause of text looking squeezed before.
+        font_size = max(11, round(size * 0.1))
         width = pad*2 + size + gap + close_size + gap + text_w
         height = pad*2 + max(size, close_size)
 
@@ -1440,7 +1444,7 @@ class FloatingWidget(tk.Toplevel):
 
         self.status_var = tk.StringVar(value="Ready")
         self.status_lbl = tk.Label(card, textvariable=self.status_var,
-                                   font=ui_font(10, bold=True), bg=C_SURFACE,
+                                   font=ui_font(font_size, bold=True), bg=C_SURFACE,
                                    fg=C_GREEN, wraplength=text_w-10, justify="left")
         self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
                               width=text_w, height=height)
@@ -1507,6 +1511,7 @@ class FloatingWidget(tk.Toplevel):
         self.app.cfg["show_floating"] = False
         save_config(self.app.cfg)
         self.app._close_floating_widget()
+        self.app._refresh_floating_toggle_btn()
 
     # ── Mirrors of the main window's status updates ──────────────────────────
     def set_status(self, msg, colour):
@@ -1593,6 +1598,12 @@ class SimpleApp:
                          command=self._toggle_compact)
         self.compact_btn.pack(side="right", padx=(0, 14))
 
+        self.floating_toggle_btn = tk.Button(top, font=ui_font(9), bd=0,
+                         bg=C_BG, activebackground=C_BG, cursor="hand2",
+                         command=self._toggle_floating_button)
+        self.floating_toggle_btn.pack(side="right", padx=(0, 14))
+        self._refresh_floating_toggle_btn()
+
         # Status row: spinner + message side by side
         self.status_row = tk.Frame(outer, bg=C_BG)
         self.status_row.pack(side="top", pady=8)
@@ -1626,7 +1637,7 @@ class SimpleApp:
             self.root.after(300, self._open_settings_first_run)
 
         if self.cfg.get("show_floating"):
-            self.root.after(200, self._open_floating_widget)
+            self.root.after(30, self._open_floating_widget)
 
     # ── Floating widget ──────────────────────────────────────────────────────
     def _open_floating_widget(self):
@@ -1654,6 +1665,20 @@ class SimpleApp:
             self._open_floating_widget()
         else:
             self._close_floating_widget()
+
+    def _toggle_floating_button(self):
+        """Main-screen toggle (top bar) for the floating widget — quicker
+        than going through Settings. On by default; this just flips it."""
+        new_state = not self.cfg.get("show_floating", True)
+        log_event("BUTTON", f"Floating toggle clicked -> {'on' if new_state else 'off'}")
+        self._toggle_floating_setting(new_state)
+        self._refresh_floating_toggle_btn()
+
+    def _refresh_floating_toggle_btn(self):
+        on = self.cfg.get("show_floating", True)
+        self.floating_toggle_btn.config(
+            text="Floating: On" if on else "Floating: Off",
+            fg=C_GREEN if on else C_MUTED)
 
     # ── Responsive layout ────────────────────────────────────────────────────
     def _on_window_configure(self, event):
@@ -1776,6 +1801,7 @@ class SimpleApp:
             self._open_floating_widget()
         else:
             self._close_floating_widget()
+        self._refresh_floating_toggle_btn()
         if self.cfg.get("groq_api_key"):
             self._set_status("Ready. Press the green button and start talking", C_GREEN)
 
