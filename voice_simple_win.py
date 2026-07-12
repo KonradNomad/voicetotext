@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.12.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -296,6 +296,7 @@ DEFAULT_CONFIG = {
     "floating_x":         None,   # remembered position after dragging
     "floating_y":         None,
     "speech_rate":       165,   # words per minute for read-aloud
+    "scale_override":    None,  # manual correction if auto-detected DPI looks wrong
 }
 
 def load_config():
@@ -951,6 +952,10 @@ class SettingsWindow(tk.Toplevel):
         win_h = min(px(600), screen_h - px(100))
         win_w = max(win_w, px(360))
         win_h = max(win_h, px(420))
+        # Safety net: never let the floor above push the window past the
+        # actual screen size, even if DPI scaling was detected incorrectly.
+        win_w = min(win_w, screen_w - 20)
+        win_h = min(win_h, screen_h - 20)
         x = (screen_w - win_w) // 2
         y = max(20, (screen_h - win_h) // 2)
         self.geometry(f"{win_w}x{win_h}+{x}+{y}")
@@ -1030,6 +1035,35 @@ class SettingsWindow(tk.Toplevel):
         tk.Checkbutton(body, text="Show key", variable=self.show_var,
                        command=self._toggle_key, bg=C_BG,
                        font=ui_font(9)).pack(anchor="w", padx=20)
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
+        # ── Display size correction ───────────────────────────────────────────
+        # Windows doesn't always report screen scaling correctly, especially
+        # on some computers — this lets it be corrected by eye instead of
+        # relying on automatic detection alone.
+        tk.Label(body, text="Display Size", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="If everything looks too big or too small on this "
+                      "computer, choose a different size below, then close "
+                      "and reopen the app.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-60).pack(anchor="w", padx=20)
+
+        scale_row = tk.Frame(body, bg=C_BG)
+        scale_row.pack(anchor="w", padx=20, pady=(6, 4))
+        self.scale_var = tk.StringVar(
+            value=str(cfg.get("scale_override")) if cfg.get("scale_override") else "auto")
+        self._scale_buttons = {}
+        for label, val in [("Smaller", "0.8"), ("Normal", "1.0"),
+                           ("Larger", "1.3"), ("Auto", "auto")]:
+            b = tk.Button(scale_row, text=label, font=ui_font(9, bold=True),
+                         bd=1, relief="solid", padx=px(8), pady=px(3),
+                         command=lambda v=val: self._pick_scale(v))
+            b.pack(side="left", padx=(0, 6))
+            self._scale_buttons[val] = b
+        self._refresh_scale_buttons()
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
@@ -1244,6 +1278,26 @@ class SettingsWindow(tk.Toplevel):
 
     def _toggle_key(self):
         self.key_entry.config(show="" if self.show_var.get() else "*")
+
+    def _pick_scale(self, val):
+        # Saves immediately rather than waiting for the main Save button —
+        # this needs a restart regardless, so it's more foolproof to just
+        # apply it right away than to rely on remembering a second step.
+        self.scale_var.set(val)
+        self.cfg["scale_override"] = None if val == "auto" else float(val)
+        save_config(self.cfg)
+        self._refresh_scale_buttons()
+        log_event("SETTINGS", f"display size set to {val}")
+
+    def _refresh_scale_buttons(self):
+        current = self.scale_var.get()
+        for val, btn in self._scale_buttons.items():
+            if val == current:
+                btn.config(bg=C_BLUE, fg="white", activebackground=C_BLUE_H,
+                          highlightbackground=C_BLUE)
+            else:
+                btn.config(bg=C_SURFACE, fg=C_TEXT, activebackground=C_BORDER,
+                          highlightbackground=C_BORDER)
 
     def _open_mic_privacy(self):
         try:
@@ -1470,7 +1524,11 @@ class FloatingWidget(tk.Toplevel):
         """
         logical_size = max(self.MIN_SIZE, min(self.MAX_SIZE, logical_size))
         size = px(logical_size)
-        close_size = max(px(28), int(size * 0.55))
+        # The close button keeps a comfortable minimum regardless of how
+        # small the record button gets — letting it shrink all the way
+        # down with a tiny record button made it too small to see or
+        # click reliably.
+        close_size = max(px(36), int(size * 0.55))
         pad = px(14)
         gap = px(10)
         text_w = max(px(110), int(size * 1.7))
@@ -1680,6 +1738,10 @@ class SimpleApp:
         win_h = min(px(820), avail_h)
         win_w = max(win_w, px(460))
         win_h = max(win_h, px(480))
+        # Safety net: never let the floor above push the window past the
+        # actual screen size, even if DPI scaling was detected incorrectly.
+        win_w = min(win_w, screen_w - 20)
+        win_h = min(win_h, screen_h - 20)
         x = (screen_w - win_w) // 2
         y = max(20, (screen_h - win_h) // 2)
         root.geometry(f"{win_w}x{win_h}+{x}+{y}")
@@ -1705,9 +1767,9 @@ class SimpleApp:
         # with the control buttons and squeeze them out of view.
         title_row = tk.Frame(top, bg=C_BG)
         title_row.pack(side="top", fill="x")
-        title = tk.Label(title_row, text="Voice to Text", font=ui_font(17, bold=True),
+        self.title_lbl = tk.Label(title_row, text="Voice to Text", font=ui_font(17, bold=True),
                          bg=C_BG, fg=C_TEXT)
-        title.pack(side="left")
+        self.title_lbl.pack(side="left")
 
         # Row 2: always its own row underneath the title, so shrinking the
         # window never pushes these out of sight or hides them behind
@@ -1855,16 +1917,38 @@ class SimpleApp:
 
         # A single row can only grow as tall as one button, so height is
         # rarely the limiting factor here — width usually is once there
-        # are 3-4 buttons side by side. The min/max bounds scale with DPI
-        # so buttons stay a consistent physical size on any display.
-        new_size = int(max(px(90), min(px(210), max_w, avail_h)))
+        # are 3-4 buttons side by side.
+        #
+        # IMPORTANT: fitting the actual window always wins. Forcing a
+        # minimum size regardless of available space is what caused
+        # buttons and text to overflow off the window on some screens.
+        # Only an absolute tiny floor remains, purely so buttons can never
+        # shrink to literally nothing.
+        fit_size = min(px(210), max_w, avail_h)
+        new_size = int(max(px(40), fit_size))
         self._btn_size_current = new_size
 
         for _, btn in self._buttons:
             btn.resize(new_size)
 
         wrap = max(200, min(620, win_w - 80))
-        self.status_lbl.config(wraplength=wrap)
+
+        # Font sizes now scale with the same responsive button size, so the
+        # text actually shrinks and grows with the window instead of just
+        # wrapping a fixed-size font into more and more lines (which is
+        # what caused text to overflow badly on smaller windows before).
+        # These are computed directly in pixels from new_size, which is
+        # already DPI-scaled — going through ui_font() again here would
+        # double-scale it.
+        fam = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
+        status_font_px = max(11, min(22, int(new_size * 0.10)))
+        text_font_px   = max(12, min(24, int(new_size * 0.12)))
+        title_font_px  = max(14, min(26, int(new_size * 0.13)))
+
+        self.status_lbl.config(wraplength=wrap, font=(fam, status_font_px, "bold"))
+        self.text.config(font=(fam, text_font_px))
+        if hasattr(self, "title_lbl"):
+            self.title_lbl.config(font=(fam, title_font_px, "bold"))
 
     # ── Compact / full view toggle ───────────────────────────────────────────
     def _toggle_compact(self):
@@ -2346,13 +2430,25 @@ def main():
         # to match. 96 DPI is Windows' 100% baseline; winfo_fpixels('1i')
         # returns however many pixels actually make up one inch on this
         # specific display right now, whatever its scaling is set to.
+        #
+        # Windows' own DPI reporting is not always reliable — some setups
+        # (particularly frozen .exe builds) can end up with the display
+        # scaling applied twice, making everything oversized. If the
+        # person has set a manual correction in Settings, it overrides
+        # the automatic detection entirely.
         global DPI_SCALE
-        try:
-            measured = root.winfo_fpixels("1i") / 96.0
-            DPI_SCALE = max(0.75, min(3.0, measured))
-        except Exception:
-            DPI_SCALE = 1.0
-        log_event("APP", f"DPI scale detected: {DPI_SCALE:.2f}")
+        cfg_preview = load_config()
+        override = cfg_preview.get("scale_override")
+        if override:
+            DPI_SCALE = max(0.4, min(3.0, float(override)))
+            log_event("APP", f"DPI scale: using manual override {DPI_SCALE:.2f}")
+        else:
+            try:
+                measured = root.winfo_fpixels("1i") / 96.0
+                DPI_SCALE = max(0.75, min(3.0, measured))
+            except Exception:
+                DPI_SCALE = 1.0
+            log_event("APP", f"DPI scale detected: {DPI_SCALE:.2f}")
 
         root.withdraw()   # avoid a flash of unscaled content while building
         SimpleApp(root)
