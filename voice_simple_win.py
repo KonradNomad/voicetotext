@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.7.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -271,6 +271,10 @@ DEFAULT_CONFIG = {
     "show_clear":        True,
     "auto_type":         True,   # type the words where the cursor is
     "type_delay":        5,      # seconds to wait before typing (3-15)
+    "show_floating":      False,  # persistent floating record button
+    "floating_size":      64,     # diameter of the floating record button
+    "floating_x":         None,   # remembered position after dragging
+    "floating_y":         None,
     "speech_rate":       165,   # words per minute for read-aloud
 }
 
@@ -694,22 +698,27 @@ class RoundButton(tk.Canvas):
     RADIUS_FRAC = 0.13   # corner radius as a fraction of the button size
 
     def __init__(self, parent, icon, label, colour, hover, command,
-                 size=200, bg=None):
+                 size=200, bg=None, show_label=True, bind_click=True):
         super().__init__(parent, width=size, height=size,
                          bg=bg or C_BG, highlightthickness=0, cursor="hand2")
         self._size = size
-        self._icon = icon          # one of: record, stop, copy, read, clear
+        self._icon = icon          # one of: record, stop, copy, read, clear, close
         self._colour = colour
         self._hover = hover
         self._command = command
         self._label_text = label
+        self._show_label = show_label
         self._pulse_on = False
         self._pulse_step = 0
 
         self._draw(self._colour)
         self.bind("<Enter>", lambda e: self._draw(self._hover))
         self.bind("<Leave>", lambda e: self._draw(self._colour))
-        self.bind("<Button-1>", lambda e: self._command())
+        if bind_click:
+            # Some callers (like the draggable floating widget) need to
+            # tell a click apart from the start of a drag themselves, so
+            # they manage the click binding externally instead.
+            self.bind("<Button-1>", lambda e: self._command())
 
     def _rounded_rect(self, x0, y0, x1, y1, r, **kw):
         pts = [x0+r,y0, x1-r,y0, x1,y0, x1,y0+r, x1,y1-r, x1,y1,
@@ -760,6 +769,13 @@ class RoundButton(tk.Canvas):
             self.create_polygon(
                 ax, ay-r*0.28, ax+r*0.30, ay+r*0.06, ax-r*0.14, ay+r*0.26,
                 fill=white, outline="")
+        elif ic == "close":
+            # A simple X, used for the floating widget's close button
+            lw = max(2, int(r*0.22))
+            self.create_line(cx-r*0.6, cy-r*0.6, cx+r*0.6, cy+r*0.6,
+                             fill=white, width=lw, capstyle="round")
+            self.create_line(cx-r*0.6, cy+r*0.6, cx+r*0.6, cy-r*0.6,
+                             fill=white, width=lw, capstyle="round")
 
     def _draw(self, fill):
         self._current_fill = fill
@@ -771,8 +787,19 @@ class RoundButton(tk.Canvas):
         if self._pulse_on:
             ring_pad = pad - 6 + (self._pulse_step % 3) * 2
             ring_pad = max(2, ring_pad)
-            self._rounded_rect(ring_pad, ring_pad, s-ring_pad, s-ring_pad,
-                               radius+6, fill="", outline=self._colour, width=3)
+            if self._show_label:
+                self._rounded_rect(ring_pad, ring_pad, s-ring_pad, s-ring_pad,
+                                   radius+6, fill="", outline=self._colour, width=3)
+            else:
+                self.create_oval(ring_pad, ring_pad, s-ring_pad, s-ring_pad,
+                                 fill="", outline=self._colour, width=3)
+
+        if not self._show_label:
+            # Icon-only mode (used by the floating widget): a true circle
+            # with the icon filling most of it, no label — small and clean.
+            self.create_oval(pad, pad, s-pad, s-pad, fill=fill, outline="")
+            self._draw_icon(s/2, s/2, s*0.28)
+            return
 
         self._rounded_rect(pad, pad, s-pad, s-pad, radius, fill=fill, outline="")
 
@@ -1039,6 +1066,43 @@ class SettingsWindow(tk.Toplevel):
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
+        # ── Floating record button ────────────────────────────────────────────
+        tk.Label(body, text="Floating Record Button", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="A small record button that stays on top of every other "
+                      "window, in the bottom-right of the screen. Click it "
+                      "to record without switching back to this app.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-60).pack(anchor="w", padx=20)
+
+        self.floating_var = tk.BooleanVar(value=cfg.get("show_floating", False))
+        tk.Checkbutton(body, text="Show the floating record button",
+                       variable=self.floating_var, bg=C_BG,
+                       font=ui_font(11)).pack(anchor="w", padx=30, pady=(4, 2))
+        tk.Label(body, text="You can also close it any time with its own X button, "
+                            "or drag it anywhere by pressing and holding.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-90).pack(anchor="w", padx=30, pady=(0, 8))
+
+        size_row = tk.Frame(body, bg=C_BG)
+        size_row.pack(anchor="w", padx=30, pady=(0, 4), fill="x")
+        tk.Label(size_row, text="Button size:", font=ui_font(10),
+                bg=C_BG, fg=C_TEXT).pack(side="left")
+        self.floating_size_var = tk.IntVar(value=int(cfg.get("floating_size", 64)))
+        self.floating_size_lbl = tk.Label(size_row, text=f"{self.floating_size_var.get()} px",
+                                          font=ui_font(10, bold=True), bg=C_BG, fg=C_BLUE)
+        self.floating_size_lbl.pack(side="right")
+        floating_size_scale = tk.Scale(body, from_=40, to=110, orient="horizontal",
+                               variable=self.floating_size_var, bg=C_BG, fg=C_TEXT,
+                               troughcolor=C_BORDER, highlightthickness=0,
+                               showvalue=False, length=win_w-90,
+                               command=lambda v: self.floating_size_lbl.config(
+                                   text=f"{int(float(v))} px"))
+        floating_size_scale.pack(anchor="w", padx=30, pady=(0, 10))
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
         self.autotype_var = tk.BooleanVar(value=cfg.get("auto_type", True))
         tk.Checkbutton(body, text="Type the words where I click (after recording)",
                        variable=self.autotype_var, bg=C_BG,
@@ -1287,6 +1351,8 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["show_clear"] = self.clear_var.get()
         self.cfg["auto_type"]  = self.autotype_var.get()
         self.cfg["type_delay"] = int(self.delay_var.get())
+        self.cfg["show_floating"] = self.floating_var.get()
+        self.cfg["floating_size"] = int(self.floating_size_var.get())
         save_config(self.cfg)
         self.on_save()
         self.destroy()
@@ -1312,6 +1378,151 @@ def classify_api_error(exc):
     return None
 
 
+# ─── Floating always-on-top record widget ────────────────────────────────────
+class FloatingWidget(tk.Toplevel):
+    """
+    A small always-on-top window with a record button, a close button, and
+    a status/countdown label. Sits above every other window so recording
+    never requires switching back to the main app window.
+
+    Both buttons are real RoundButtons (not tiny text), and the whole
+    widget can be dragged by pressing and holding anywhere on it —
+    including on the buttons themselves — and moving the mouse. A short
+    movement threshold distinguishes "held and dragged" from "just
+    clicked", so dragging never accidentally triggers Record or Close.
+    """
+    DRAG_THRESHOLD = 4  # pixels of movement before a press counts as a drag
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.overrideredirect(True)        # no title bar / borders
+        self.attributes("-topmost", True)  # always above other windows
+        try:
+            self.attributes("-alpha", 0.97)  # not universally supported; ignore if not
+        except Exception:
+            pass
+        self.configure(bg=C_BG)
+
+        size = int(app.cfg.get("floating_size", 64))
+        size = max(40, min(110, size))
+        close_size = max(28, int(size * 0.55))  # a real button, scaled to match
+        pad = 12
+        gap = 8
+        text_w = max(90, int(size * 1.7))
+        width = pad*2 + size + gap + close_size + gap + text_w
+        height = pad*2 + max(size, close_size)
+
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        margin = 20
+        x = app.cfg.get("floating_x")
+        y = app.cfg.get("floating_y")
+        if x is None or y is None:
+            x = screen_w - width - margin
+            y = screen_h - height - margin - 50  # sit above the taskbar
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        card = tk.Frame(self, bg=C_SURFACE, highlightbackground=C_BORDER,
+                        highlightthickness=1)
+        card.pack(fill="both", expand=True)
+
+        self.record_btn = RoundButton(card, "record", "", C_GREEN, C_GREEN_H,
+                                      self._on_record, size=size, bg=C_SURFACE,
+                                      show_label=False, bind_click=False)
+        self.record_btn.place(x=pad, y=pad + (max(size, close_size)-size)//2)
+
+        self.close_btn = RoundButton(card, "close", "", C_GREY, C_RED,
+                                     self._close, size=close_size, bg=C_SURFACE,
+                                     show_label=False, bind_click=False)
+        self.close_btn.place(x=pad + size + gap,
+                             y=pad + (max(size, close_size)-close_size)//2)
+
+        self.status_var = tk.StringVar(value="Ready")
+        self.status_lbl = tk.Label(card, textvariable=self.status_var,
+                                   font=ui_font(10, bold=True), bg=C_SURFACE,
+                                   fg=C_GREEN, wraplength=text_w-10, justify="left")
+        self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
+                              width=text_w, height=height)
+
+        # ── Drag handling (screen-coordinate based, with click/drag split) ────
+        self._press_root = None
+        self._press_winpos = None
+        self._dragged = False
+        self._press_widget = None
+
+        for w in (card, self.record_btn, self.close_btn, self.status_lbl):
+            w.bind("<ButtonPress-1>", self._on_press)
+            w.bind("<B1-Motion>", self._on_motion)
+            w.bind("<ButtonRelease-1>", self._on_release)
+
+    # ── Drag / click handling ─────────────────────────────────────────────────
+    def _on_press(self, event):
+        self._press_root = (event.x_root, event.y_root)
+        self._press_winpos = (self.winfo_x(), self.winfo_y())
+        self._dragged = False
+        self._press_widget = event.widget
+
+    def _on_motion(self, event):
+        if self._press_root is None:
+            return
+        dx = event.x_root - self._press_root[0]
+        dy = event.y_root - self._press_root[1]
+        if not self._dragged and (abs(dx) > self.DRAG_THRESHOLD or abs(dy) > self.DRAG_THRESHOLD):
+            self._dragged = True
+        if self._dragged:
+            new_x = self._press_winpos[0] + dx
+            new_y = self._press_winpos[1] + dy
+            self.geometry(f"+{new_x}+{new_y}")
+
+    def _on_release(self, event):
+        if not self._dragged:
+            # A genuine click (didn't move past the threshold) — act on
+            # whichever widget the press started on.
+            if self._press_widget is self.record_btn:
+                self._on_record()
+            elif self._press_widget is self.close_btn:
+                self._close()
+        else:
+            # Drag finished — remember the new position for next launch.
+            self.app.cfg["floating_x"] = self.winfo_x()
+            self.app.cfg["floating_y"] = self.winfo_y()
+            save_config(self.app.cfg)
+        self._press_root = None
+        self._dragged = False
+        self._press_widget = None
+
+    def _on_record(self):
+        if not self.app._recording:
+            # Starting a fresh recording from the floating widget: clear
+            # the text box first so each new bit of speech starts clean
+            # rather than piling onto whatever was said before — otherwise
+            # Copy Text would grab everything said since the widget opened
+            # instead of just the latest part.
+            self.app._clear_text_for_next_recording()
+        self.app._on_record()
+
+    def _close(self):
+        log_event("BUTTON", "Floating widget closed")
+        self.app.cfg["show_floating"] = False
+        save_config(self.app.cfg)
+        self.app._close_floating_widget()
+
+    # ── Mirrors of the main window's status updates ──────────────────────────
+    def set_status(self, msg, colour):
+        short = msg if len(msg) <= 46 else msg[:43] + "..."
+        self.status_var.set(short)
+        self.status_lbl.config(fg=colour)
+
+    def set_recording_state(self, recording):
+        if recording:
+            self.record_btn.set(icon="stop", colour=C_RED, hover=C_RED_H)
+            self.record_btn.pulse_start()
+        else:
+            self.record_btn.set(icon="record", colour=C_GREEN, hover=C_GREEN_H)
+            self.record_btn.pulse_stop()
+
+
 class SimpleApp:
     def __init__(self, root):
         log_event("APP", f"started — version {APP_VERSION}, platform {sys.platform}")
@@ -1330,6 +1541,7 @@ class SimpleApp:
         self._full_height = None   # remembered so "Full view" can restore it
         self._resize_job = None
         self._buttons = []         # list of (key, RoundButton)
+        self.floating = None       # the FloatingWidget, if shown
 
         root.title("Voice to Text")
         root.configure(bg=C_BG)
@@ -1412,6 +1624,36 @@ class SimpleApp:
         if not self.cfg.get("groq_api_key"):
             self._set_status("Click the gear (top right) to add your Groq key", C_RED)
             self.root.after(300, self._open_settings_first_run)
+
+        if self.cfg.get("show_floating"):
+            self.root.after(200, self._open_floating_widget)
+
+    # ── Floating widget ──────────────────────────────────────────────────────
+    def _open_floating_widget(self):
+        if self.floating is not None:
+            return
+        try:
+            self.floating = FloatingWidget(self)
+            log_event("APP", "floating widget shown")
+        except Exception as e:
+            log_error("open_floating_widget", e)
+
+    def _close_floating_widget(self):
+        if self.floating is not None:
+            try:
+                self.floating.destroy()
+            except Exception:
+                pass
+            self.floating = None
+            log_event("APP", "floating widget hidden")
+
+    def _toggle_floating_setting(self, show):
+        self.cfg["show_floating"] = show
+        save_config(self.cfg)
+        if show:
+            self._open_floating_widget()
+        else:
+            self._close_floating_widget()
 
     # ── Responsive layout ────────────────────────────────────────────────────
     def _on_window_configure(self, event):
@@ -1524,8 +1766,16 @@ class SimpleApp:
                   f"buttons: copy={self.cfg.get('show_copy')} "
                   f"read={self.cfg.get('show_read')} "
                   f"clear={self.cfg.get('show_clear')}, "
-                  f"auto_type={self.cfg.get('auto_type')}")
+                  f"auto_type={self.cfg.get('auto_type')}, "
+                  f"floating={self.cfg.get('show_floating')}")
         self._build_buttons()
+        if self.cfg.get("show_floating"):
+            # Rebuild fresh even if it was already open, so a changed size
+            # takes effect immediately rather than needing a manual toggle.
+            self._close_floating_widget()
+            self._open_floating_widget()
+        else:
+            self._close_floating_widget()
         if self.cfg.get("groq_api_key"):
             self._set_status("Ready. Press the green button and start talking", C_GREEN)
 
@@ -1555,6 +1805,8 @@ class SimpleApp:
             self._recording = False
             self.record_btn.pulse_stop()
             self.record_btn.set(icon="record", label="RECORD", colour=C_GREEN, hover=C_GREEN_H)
+            if self.floating is not None:
+                self.floating.set_recording_state(False)
             self._set_status(
                 "Can't reach the microphone — check the gear for Microphone help",
                 C_RED)
@@ -1563,6 +1815,8 @@ class SimpleApp:
         log_event("RECORD", "started listening")
         self.record_btn.set(icon="stop", label="STOP", colour=C_RED, hover=C_RED_H)
         self.record_btn.pulse_start()
+        if self.floating is not None:
+            self.floating.set_recording_state(True)
         self._set_status("Listening... press STOP when you are done", C_RED)
 
         # ── Streaming setup ───────────────────────────────────────────────────
@@ -1632,6 +1886,8 @@ class SimpleApp:
         self.recorder.stop()
         self.record_btn.pulse_stop()
         self.record_btn.set(icon="record", label="RECORD", colour=C_GREEN, hover=C_GREEN_H)
+        if self.floating is not None:
+            self.floating.set_recording_state(False)
         dur = self.recorder.duration()
         log_event("BUTTON", f"Record clicked (stop) — recorded {dur:.1f}s")
 
@@ -1821,6 +2077,17 @@ class SimpleApp:
         self.text.delete("1.0", "end")
         self._set_status("Press the green button and start talking", C_GREEN)
 
+    def _clear_text_for_next_recording(self):
+        """
+        Used by the floating widget: wipes the text box right before a new
+        recording starts, so each bit of speech starts fresh instead of
+        piling onto whatever was said before. Quieter than Start Over —
+        no status message change, since a new recording is about to begin
+        anyway.
+        """
+        self.text.delete("1.0", "end")
+        log_event("FLOATING", "cleared text box for next recording")
+
     # ── Helpers (thread-safe via root.after) ──────────────────────────────────
     def _get_text(self):
         return self.text.get("1.0", "end").strip()
@@ -1835,8 +2102,12 @@ class SimpleApp:
         self.root.after(0, do)
 
     def _set_status(self, msg, colour=C_GREEN):
-        self.root.after(0, lambda: (self.status_var.set(msg),
-                                    self.status_lbl.config(fg=colour)))
+        def do():
+            self.status_var.set(msg)
+            self.status_lbl.config(fg=colour)
+            if self.floating is not None:
+                self.floating.set_status(msg, colour)
+        self.root.after(0, do)
 
     def _spin_start(self, colour=C_BLUE):
         self.root.after(0, lambda: self.spinner.start(colour))
