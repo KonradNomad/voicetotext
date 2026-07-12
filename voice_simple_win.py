@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.5.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -59,6 +59,75 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 pyautogui.FAILSAFE = False  # don't abort if mouse hits screen corner
+
+# ─── Layout-independent typing on Windows ─────────────────────────────────────
+# pyautogui.write() simulates individual key presses assuming a US keyboard
+# layout, so characters that sit on different keys on other layouts can come
+# out wrong or missing (this is what caused the missing @ symbol earlier).
+#
+# Rather than trying to detect and adapt to whichever of the many keyboard
+# layouts is active — fragile, since there are dozens with different dead
+# keys and symbol placements — Windows offers a way to sidestep the problem
+# entirely: SendInput with the KEYEVENTF_UNICODE flag injects the actual
+# character directly at the OS level, not a simulated physical key press.
+# It works correctly no matter which layout is active, because it never
+# goes through layout mapping in the first place. This works automatically
+# for every layout without the app needing to know what layout is in use.
+if sys.platform.startswith("win"):
+    import ctypes
+
+    _PUL = ctypes.POINTER(ctypes.c_ulong)
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", ctypes.c_ushort),
+                    ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", _PUL)]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", ctypes.c_ulong),
+                    ("wParamL", ctypes.c_short),
+                    ("wParamH", ctypes.c_ushort)]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long),
+                    ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", _PUL)]
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("union", _INPUT_UNION)]
+
+    _INPUT_KEYBOARD = 1
+    _KEYEVENTF_UNICODE = 0x0004
+    _KEYEVENTF_KEYUP = 0x0002
+
+    def _send_unicode_char(ch, keyup=False):
+        extra = ctypes.c_ulong(0)
+        flags = _KEYEVENTF_UNICODE | (_KEYEVENTF_KEYUP if keyup else 0)
+        ki = _KEYBDINPUT(0, ord(ch), flags, 0, ctypes.pointer(extra))
+        inp = _INPUT(_INPUT_KEYBOARD, _INPUT_UNION(ki=ki))
+        ctypes.windll.user32.SendInput(1, ctypes.pointer(inp), ctypes.sizeof(inp))
+
+    def type_unicode_windows(text, delay=0.004):
+        """Type text one character at a time via direct Unicode injection —
+        correct on any keyboard layout, because layout is never consulted."""
+        for ch in text:
+            if ch == "\n":
+                # Enter needs a real virtual-key event, not a unicode one
+                ctypes.windll.user32.keybd_event(0x0D, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0x0D, 0, _KEYEVENTF_KEYUP, 0)
+            else:
+                _send_unicode_char(ch, keyup=False)
+                _send_unicode_char(ch, keyup=True)
+            if delay:
+                time.sleep(delay)
 
 # ─── Paths / config ───────────────────────────────────────────────────────────
 # Config lives in a per-user folder that works on both Windows and Linux.
@@ -472,12 +541,28 @@ def transcribe_bytes(raw_bytes, cfg, rate=16000, channels=1):
 
 # ─── Transcription ────────────────────────────────────────────────────────────
 def transcribe(audio_path, cfg):
+    """
+    Send audio to Groq for transcription. Retries once after a short pause
+    on failure — VPN connections sometimes drop a single request and then
+    work again moments later, so this can quietly recover from a blip
+    without the person needing to notice or press Record again. It won't
+    help with a VPN that's blocked outright the whole session, only
+    genuinely transient hiccups.
+    """
     client = Groq(api_key=cfg["groq_api_key"])
     kwargs = dict(file=("audio.wav", open(audio_path,"rb")),
                   model=cfg["model"], response_format="json", temperature=0)
     if cfg.get("language"):
         kwargs["language"] = cfg["language"]
-    return client.audio.transcriptions.create(**kwargs).text.strip()
+
+    try:
+        return client.audio.transcriptions.create(**kwargs).text.strip()
+    except Exception as e:
+        log_event("TRANSCRIBE", f"first attempt failed ({type(e).__name__}), retrying once...")
+        time.sleep(1.5)
+        # Re-open the file — it was consumed by the failed attempt
+        kwargs["file"] = ("audio.wav", open(audio_path, "rb"))
+        return client.audio.transcriptions.create(**kwargs).text.strip()
 
 # ─── AI cleanup ───────────────────────────────────────────────────────────────
 def _extract_after_rewrite_phrase(text):
@@ -1642,7 +1727,7 @@ class SimpleApp:
 
     def _countdown_and_type(self, text):
         """Countdown (configurable, 3-15s) so the user can click where the
-        words should go, then the words type themselves at the cursor."""
+        words should go, then the words get typed/pasted at the cursor."""
         delay = int(self.cfg.get("type_delay", 5))
         delay = max(3, min(15, delay))
         for remaining in range(delay, 0, -1):
@@ -1651,14 +1736,67 @@ class SimpleApp:
                 C_BLUE)
             time.sleep(1)
         self._set_status("Typing your words...", C_BLUE)
+        self._type_at_cursor(text + " ")
+
+    def _type_at_cursor(self, text):
+        """
+        Insert text at the cursor. On Windows this uses direct Unicode
+        character injection, which works correctly regardless of whatever
+        keyboard layout is active — that's the general fix for symbols
+        coming out wrong, rather than trying to detect and match a specific
+        layout. If that's unavailable for any reason, or on other
+        platforms, it falls back to clipboard + paste.
+        """
+        if sys.platform.startswith("win"):
+            try:
+                type_unicode_windows(text)
+                log_event("TYPE", "typed via Unicode injection (layout-independent)")
+                self._set_status("Done! Your words have been typed", C_GREEN)
+                return
+            except Exception as e:
+                log_error("type_unicode_windows", e)
+                log_event("TYPE", f"Unicode injection failed, trying paste instead: {e}")
+
         try:
-            pyautogui.write(text + " ", interval=0.01)
-            log_event("TYPE", "typed successfully at cursor")
+            self._paste_text(text)
+            log_event("TYPE", "typed via clipboard paste")
             self._set_status("Done! Your words have been typed", C_GREEN)
         except Exception as e:
             log_error("countdown_and_type", e)
             log_event("TYPE", f"failed: {type(e).__name__}: {e}")
             self._set_status("Couldn't type there — use the COPY button instead", C_MUTED)
+
+    def _paste_text(self, text):
+        """
+        Insert text at the cursor via clipboard + paste. Used as the
+        fallback on Windows, and as the primary method elsewhere.
+        """
+        # Remember whatever was on the clipboard so we can restore it after,
+        # so this doesn't clobber something the person had copied earlier.
+        old_clip = None
+        try:
+            old_clip = self.root.clipboard_get()
+        except Exception:
+            old_clip = None
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()          # flush to the OS clipboard
+        time.sleep(0.15)            # give the OS a moment to register it
+
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.1)
+
+        # Restore the previous clipboard content shortly after, without
+        # blocking the UI.
+        def _restore():
+            try:
+                if old_clip is not None:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(old_clip)
+            except Exception:
+                pass
+        self.root.after(800, _restore)
 
     def _on_copy(self):
         log_event("BUTTON", "Copy Text clicked")
