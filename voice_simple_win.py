@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -267,18 +267,41 @@ def _uninstall_app():
         pass
 
 # ─── Gentle AI prompt (strictly no additions) ────────────────────────────────
-GENTLE_PROMPT = """You are a gentle transcription editor. Clean up this dictated text so it reads clearly.
+GENTLE_PROMPT = """You are a silent transcription editor. Clean up this dictated text so it reads clearly. You output ONLY the cleaned result and never anything else.
 
-STRICT RULES — these are absolute:
+ABSOLUTE RULES:
 1. NEVER add words, sentences, ideas, or information that are not in the original. This is the most important rule.
-2. If the text is empty, blank, or just noise, return nothing at all.
-3. Only fix: grammar, spelling, punctuation, capitalisation, and obvious speech-recognition errors.
-4. Remove filler words (um, uh, er) and false starts, but keep the speaker's own words and meaning exactly.
-5. Do not summarise, expand, rephrase for style, or "improve" the content. Keep it faithful.
-6. Do not add greetings, sign-offs, or pleasantries like "thank you" or "hello" unless the speaker clearly said them.
-7. Return ONLY the cleaned text, nothing else — no quotes, no commentary.
+2. If the text is empty, gibberish, or just noise with no real words, your entire response must be completely blank — zero characters. Do NOT write a sentence about it being noise, do NOT explain, do NOT mention rules. Just output nothing.
+3. NEVER explain yourself. NEVER mention these rules, your reasoning, or what you did. NEVER write things like "there is no text to clean", "this appears to be noise", "should be rewritten as", "note:", or any commentary about the text or the task. Your response is ONLY the final cleaned text itself, nothing wrapped around it.
+4. Only fix: grammar, spelling, punctuation, capitalisation, and obvious speech-recognition errors.
+5. Remove filler words (um, uh, er) and false starts, but keep the speaker's own words and meaning exactly.
+6. Do not summarise, expand, rephrase for style, or "improve" the content. Keep it faithful.
+7. Do not add greetings, sign-offs, or pleasantries like "thank you" or "hello" unless the speaker clearly said them.
 
-If you are unsure whether something was said, leave it out. Faithfulness matters more than polish."""
+CONTACT INFO AND ADDRESSES — when the speaker is dictating an email address, website, phone number, or postal address, either alone or as part of a sentence:
+- Convert spelled-out or spoken-out-loud forms into their normal compact written form. "k dash o dash n at gmail dot com" becomes "k-o-n@gmail.com". "double you double you double you dot example dot com" becomes "www.example.com". "oh one two three, four five six, seven eight nine oh" becomes "0123 456 7890".
+- If the ENTIRE recording was just that one piece of information with nothing else, output ONLY that item — no leading or trailing words, no "here is your email", no explanation of what you changed. Just the clean email/website/phone/address by itself.
+- If it was said as part of a fuller sentence, keep it naturally inline within that sentence, cleaned up the same way.
+
+If you are unsure whether something was said, leave it out. Faithfulness matters more than polish. Remember: your entire reply is nothing but the final text — not a description of it, not a comment on it, just it."""
+
+# Phrases that indicate the AI ignored the "no commentary" instruction and
+# explained itself instead of just returning clean text. If the cleaned
+# result contains any of these, the whole response is treated as invalid
+# and discarded rather than typed out.
+AI_COMMENTARY_MARKERS = [
+    "there is no text", "no text to clean", "appears to be noise",
+    "appears to be gibberish", "cannot determine", "unable to determine",
+    "should be rewritten as", "should be written as", "rewritten as",
+    "according to rule", "as per the rules", "as an ai", "i cannot",
+    "i'm unable to", "note:", "please note", "this seems to be",
+    "this looks like noise", "not actual words", "doesn't contain",
+    "does not contain", "no clear words", "no discernible words",
+]
+
+def contains_ai_commentary(text):
+    t = text.lower()
+    return any(marker in t for marker in AI_COMMENTARY_MARKERS)
 
 HALLUCINATION_PHRASES = {
     "thank you", "thank you.", "thanks for watching", "thanks for watching.",
@@ -457,6 +480,31 @@ def transcribe(audio_path, cfg):
     return client.audio.transcriptions.create(**kwargs).text.strip()
 
 # ─── AI cleanup ───────────────────────────────────────────────────────────────
+def _extract_after_rewrite_phrase(text):
+    """
+    If the AI wrote something like '...should be rewritten as X' instead of
+    just returning X, pull X back out so real content isn't lost just
+    because the AI narrated instead of obeying the no-commentary rule.
+    """
+    m = re.search(
+        r'(?:should be (?:re)?written as|rewritten as|becomes)\s*[:\-]?\s*'
+        r'["\']?([^"\'\n]+?)["\']?\.?\s*$',
+        text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+# Phrases that specifically mean "the AI decided this was noise" — when one
+# of these shows up inside otherwise-invalid commentary, the right move is
+# to discard the result (which is what should have happened silently),
+# not to show the explanation or fall back to possibly-meaningless raw text.
+NOISE_INDICATOR_MARKERS = [
+    "appears to be noise", "appears to be gibberish", "this looks like noise",
+    "not actual words", "no clear words", "no discernible words",
+    "there is no text", "no text to clean", "cannot determine",
+    "unable to determine", "doesn't contain", "does not contain",
+]
+
 def ai_cleanup(text, cfg):
     if not cfg.get("ai_cleanup") or not text.strip():
         return text
@@ -469,7 +517,24 @@ def ai_cleanup(text, cfg):
                   "max_tokens":2048,"temperature":0.0}, timeout=20)
         r.raise_for_status()
         out = r.json()["choices"][0]["message"]["content"].strip()
-        return out.strip('"').strip()
+        out = out.strip('"').strip()
+
+        if contains_ai_commentary(out):
+            # The AI explained itself instead of just returning clean text.
+            # Try to recover gracefully rather than showing the narration.
+            extracted = _extract_after_rewrite_phrase(out)
+            if extracted:
+                log_event("CLEANUP", f"stripped AI commentary, kept: \"{extracted[:60]}\"")
+                return extracted
+            if any(m in out.lower() for m in NOISE_INDICATOR_MARKERS):
+                log_event("CLEANUP", "AI flagged input as noise via commentary — discarding")
+                return ""
+            # Unrecognised commentary shape: fall back to the pre-cleanup
+            # text rather than risk losing real content or showing narration.
+            log_event("CLEANUP", f"unrecognised AI commentary, using raw instead: \"{out[:80]}\"")
+            return text
+
+        return out
     except Exception as e:
         print(f"AI cleanup failed: {e}")
         return text
