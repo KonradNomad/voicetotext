@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.9.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -59,6 +59,25 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 pyautogui.FAILSAFE = False  # don't abort if mouse hits screen corner
+
+# ─── Windows DPI awareness ─────────────────────────────────────────────────────
+# Different computers use different display scaling (100%, 125%, 150%, etc).
+# Without telling Windows this app understands scaling, Windows silently
+# stretches or shrinks the whole rendered window to compensate — which is
+# exactly what made everything (buttons, text, the floating widget) look
+# fine on one machine and distorted on another. Declaring DPI awareness
+# here, before any window is created, stops Windows from doing that, so
+# the app draws at the real resolution and can scale itself properly
+# instead (see DPI_SCALE / px() further down).
+if sys.platform.startswith("win"):
+    try:
+        import ctypes as _dpi_ctypes
+        try:
+            _dpi_ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor v2
+        except Exception:
+            _dpi_ctypes.windll.user32.SetProcessDPIAware()       # older Windows fallback
+    except Exception:
+        pass
 
 # ─── Layout-independent typing on Windows ─────────────────────────────────────
 # pyautogui.write() simulates individual key presses assuming a US keyboard
@@ -272,6 +291,7 @@ DEFAULT_CONFIG = {
     "auto_type":         True,   # type the words where the cursor is
     "type_delay":        5,      # seconds to wait before typing (3-15)
     "show_floating":      True,   # persistent floating record button (on by default)
+    "floating_choice_made": False, # becomes True once the user explicitly toggles it
     "floating_size":      110,    # diameter of the floating record button
     "floating_x":         None,   # remembered position after dragging
     "floating_y":         None,
@@ -283,7 +303,15 @@ def load_config():
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE) as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+                cfg = {**DEFAULT_CONFIG, **json.load(f)}
+                # Old saved files (from before the floating widget defaulted
+                # to on) can have an explicit "show_floating": false baked
+                # in, which would otherwise silently override the new
+                # default forever. Force it on until the user has actually
+                # made a deliberate choice about it themselves.
+                if not cfg.get("floating_choice_made"):
+                    cfg["show_floating"] = True
+                return cfg
         except Exception:
             pass
     return DEFAULT_CONFIG.copy()
@@ -679,14 +707,23 @@ C_PURPLE_H= "#5f4c89"
 C_GREY    = "#7a7568"   # start over (warm stone)
 C_GREY_H  = "#69645a"
 
-def ui_font(size, bold=False):
-    """Segoe UI on Windows, fallback elsewhere."""
-    fam = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
-    return (fam, size, "bold") if bold else (fam, size)
+# ─── DPI scaling ──────────────────────────────────────────────────────────────
+# Set once in main(), right after the real display scaling is known (see
+# main()). Every size in the app — fonts, button dimensions, paddings —
+# is computed through px()/ui_font() so the whole UI scales consistently
+# with whatever display scaling the actual computer is using, instead of
+# using fixed pixel counts that only looked right on one specific screen.
+DPI_SCALE = 1.0
 
-BTN_FONT    = ui_font(19, bold=True)
-TEXT_FONT   = ui_font(19)
-STATUS_FONT = ui_font(14, bold=True)
+def px(n):
+    """Scale a design-pixel measurement by the current DPI factor."""
+    return max(1, int(round(n * DPI_SCALE)))
+
+def ui_font(size, bold=False):
+    """Segoe UI on Windows, fallback elsewhere. Scales with DPI_SCALE."""
+    fam = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
+    scaled = max(7, int(round(size * DPI_SCALE)))
+    return (fam, scaled, "bold") if bold else (fam, scaled)
 
 # ─── Rounded button (canvas-drawn, hover + pulse ring) ────────────────────────
 class RoundButton(tk.Canvas):
@@ -908,14 +945,14 @@ class SettingsWindow(tk.Toplevel):
         self.update_idletasks()
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        win_w = min(480, screen_w - 80)
-        win_h = min(600, screen_h - 100)
-        win_w = max(win_w, 360)
-        win_h = max(win_h, 420)
+        win_w = min(px(480), screen_w - px(80))
+        win_h = min(px(600), screen_h - px(100))
+        win_w = max(win_w, px(360))
+        win_h = max(win_h, px(420))
         x = (screen_w - win_w) // 2
         y = max(20, (screen_h - win_h) // 2)
         self.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        self.minsize(340, 360)
+        self.minsize(px(340), px(360))
 
         outer = tk.Frame(self, bg=C_BG)
         outer.pack(fill="both", expand=True)
@@ -1076,7 +1113,7 @@ class SettingsWindow(tk.Toplevel):
                  font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
                  wraplength=win_w-60).pack(anchor="w", padx=20)
 
-        self.floating_var = tk.BooleanVar(value=cfg.get("show_floating", False))
+        self.floating_var = tk.BooleanVar(value=cfg.get("show_floating", True))
         tk.Checkbutton(body, text="Show the floating record button",
                        variable=self.floating_var, bg=C_BG,
                        font=ui_font(11)).pack(anchor="w", padx=30, pady=(4, 2))
@@ -1141,8 +1178,9 @@ class SettingsWindow(tk.Toplevel):
 
         report_frame = tk.Frame(body, bg=C_BORDER)
         report_frame.pack(fill="both", padx=20, pady=6)
-        self.report_text = tk.Text(report_frame, height=8, font=("Consolas" if
-                                   sys.platform.startswith("win") else "Courier", 9),
+        _report_fam = "Consolas" if sys.platform.startswith("win") else "Courier"
+        self.report_text = tk.Text(report_frame, height=8,
+                                   font=(_report_fam, max(7, int(round(9*DPI_SCALE)))),
                                    wrap="word", bg="#fbfaf7", fg=C_TEXT, bd=0,
                                    padx=8, pady=8)
         report_scroll = ttk.Scrollbar(report_frame, orient="vertical",
@@ -1353,6 +1391,7 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["type_delay"] = int(self.delay_var.get())
         self.cfg["show_floating"] = self.floating_var.get()
         self.cfg["floating_size"] = int(self.floating_size_var.get())
+        self.cfg["floating_choice_made"] = True
         save_config(self.cfg)
         self.on_save()
         self.destroy()
@@ -1404,16 +1443,23 @@ class FloatingWidget(tk.Toplevel):
             pass
         self.configure(bg=C_BG)
 
-        size = int(app.cfg.get("floating_size", 110))
-        size = max(110, min(200, size))
-        close_size = max(50, int(size * 0.55))  # a real button, scaled to match
-        pad = 14
-        gap = 10
-        text_w = max(140, int(size * 1.7))
+        # The slider value (110-200) is a "logical" size choice, independent
+        # of any particular screen's DPI. px() converts it to actual pixels
+        # for this specific display, so the same slider setting looks the
+        # same physical size everywhere, rather than a fixed pixel count
+        # that only looked right on one machine's scaling.
+        logical_size = int(app.cfg.get("floating_size", 110))
+        logical_size = max(110, min(200, logical_size))
+        size = px(logical_size)
+        close_size = max(px(50), int(size * 0.55))  # a real button, scaled to match
+        pad = px(14)
+        gap = px(10)
+        text_w = max(px(140), int(size * 1.7))
         # Status text scales with the button size too, so nothing looks
-        # cramped or gets cut off at any size in the 110-200 range — a
-        # fixed font size was the cause of text looking squeezed before.
-        font_size = max(11, round(size * 0.1))
+        # cramped or gets cut off at any size — font_size stays a LOGICAL
+        # point size here; ui_font() applies the DPI scaling itself, so
+        # scaling it again here would make it too large.
+        font_size = max(11, round(logical_size * 0.1))
         width = pad*2 + size + gap + close_size + gap + text_w
         height = pad*2 + max(size, close_size)
 
@@ -1509,6 +1555,7 @@ class FloatingWidget(tk.Toplevel):
     def _close(self):
         log_event("BUTTON", "Floating widget closed")
         self.app.cfg["show_floating"] = False
+        self.app.cfg["floating_choice_made"] = True
         save_config(self.app.cfg)
         self.app._close_floating_widget()
         self.app._refresh_floating_toggle_btn()
@@ -1556,16 +1603,16 @@ class SimpleApp:
         root.update_idletasks()
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
-        avail_h = screen_h - 90
-        avail_w = screen_w - 80
-        win_w = min(720, avail_w)
-        win_h = min(820, avail_h)
-        win_w = max(win_w, 460)
-        win_h = max(win_h, 480)
+        avail_h = screen_h - px(90)
+        avail_w = screen_w - px(80)
+        win_w = min(px(720), avail_w)
+        win_h = min(px(820), avail_h)
+        win_w = max(win_w, px(460))
+        win_h = max(win_h, px(480))
         x = (screen_w - win_w) // 2
         y = max(20, (screen_h - win_h) // 2)
         root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        root.minsize(460, 420)
+        root.minsize(px(460), px(420))
         self._full_height = win_h
 
         # Outer frame lets us guarantee the button row a spot at the very
@@ -1577,11 +1624,11 @@ class SimpleApp:
         # Button area — packed to the BOTTOM first, so it always keeps its
         # spot even if the window is short. The text area fills what's left.
         self.btn_frame = tk.Frame(outer, bg=C_BG)
-        self.btn_frame.pack(side="bottom", pady=14)
+        self.btn_frame.pack(side="bottom", pady=px(14))
 
         # Top bar: wordmark left, compact-toggle + gear right
         top = tk.Frame(outer, bg=C_BG)
-        top.pack(side="top", fill="x", padx=24, pady=(14, 0))
+        top.pack(side="top", fill="x", padx=px(24), pady=(px(14), 0))
         title = tk.Label(top, text="Voice to Text", font=ui_font(17, bold=True),
                          bg=C_BG, fg=C_TEXT)
         title.pack(side="left")
@@ -1607,21 +1654,21 @@ class SimpleApp:
         # Status row: spinner + message side by side
         self.status_row = tk.Frame(outer, bg=C_BG)
         self.status_row.pack(side="top", pady=8)
-        self.spinner = Spinner(self.status_row, size=36, width=5)
+        self.spinner = Spinner(self.status_row, size=px(36), width=max(2, px(5)))
         self.spinner.pack(side="left", padx=(0, 10))
         self.spinner.stop()
         self.status_var = tk.StringVar(value="Press the green button and start talking")
-        self.status_lbl = tk.Label(self.status_row, textvariable=self.status_var, font=STATUS_FONT,
+        self.status_lbl = tk.Label(self.status_row, textvariable=self.status_var, font=ui_font(14, bold=True),
                                     bg=C_BG, fg=C_GREEN, wraplength=min(620, win_w-80))
         self.status_lbl.pack(side="left")
 
         # Text area — white card with a soft hairline border. Fills whatever
         # vertical space remains between the status row and the buttons.
         self.text_frame = tk.Frame(outer, bg=C_BORDER, bd=0)
-        self.text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
+        self.text_frame.pack(side="top", fill="both", expand=True, padx=px(24), pady=px(6))
         inner = tk.Frame(self.text_frame, bg=C_SURFACE)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
-        self.text = tk.Text(inner, font=TEXT_FONT, wrap="word",
+        self.text = tk.Text(inner, font=ui_font(19), wrap="word",
                             fg=C_TEXT, bg=C_SURFACE, bd=0, padx=20, pady=18,
                             insertbackground=C_TEXT, selectbackground="#d8e4dd")
         self.text.pack(fill="both", expand=True)
@@ -1660,6 +1707,7 @@ class SimpleApp:
 
     def _toggle_floating_setting(self, show):
         self.cfg["show_floating"] = show
+        self.cfg["floating_choice_made"] = True
         save_config(self.cfg)
         if show:
             self._open_floating_widget()
@@ -1700,16 +1748,16 @@ class SimpleApp:
             return  # window not really laid out yet
 
         n = len(self._buttons)
-        gap = 14
+        gap = px(14)
 
         # Single row: all buttons share the window's width.
-        avail_w = win_w - 48
+        avail_w = win_w - px(48)
         max_w = (avail_w - (n-1)*gap) / n
 
         if self._compact:
             # In compact mode the buttons ARE the window, so let them use
             # most of the available height too.
-            avail_h = win_h - 60
+            avail_h = win_h - px(60)
         else:
             # Leave most of the height for the text area, but don't starve
             # the buttons on ordinary laptop screens.
@@ -1717,8 +1765,9 @@ class SimpleApp:
 
         # A single row can only grow as tall as one button, so height is
         # rarely the limiting factor here — width usually is once there
-        # are 3-4 buttons side by side.
-        new_size = int(max(90, min(210, max_w, avail_h)))
+        # are 3-4 buttons side by side. The min/max bounds scale with DPI
+        # so buttons stay a consistent physical size on any display.
+        new_size = int(max(px(90), min(px(210), max_w, avail_h)))
         self._btn_size_current = new_size
 
         for _, btn in self._buttons:
@@ -1742,14 +1791,14 @@ class SimpleApp:
                     self._outer.winfo_children()[1].winfo_reqheight() + 40
             win_w = self.root.winfo_width()
             self.root.geometry(f"{win_w}x{max(220, new_h)}")
-            self.root.minsize(460, 180)
+            self.root.minsize(px(460), px(180))
         else:
             self.status_row.pack(side="top", pady=8)
-            self.text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
+            self.text_frame.pack(side="top", fill="both", expand=True, padx=px(24), pady=px(6))
             self.compact_btn.config(text="Compact view")
             win_w = self.root.winfo_width()
             self.root.geometry(f"{win_w}x{self._full_height or 700}")
-            self.root.minsize(460, 420)
+            self.root.minsize(px(460), px(420))
         self.root.after(150, self._apply_responsive_size)
 
     # ── Buttons ───────────────────────────────────────────────────────────────
@@ -1768,7 +1817,7 @@ class SimpleApp:
 
         # All buttons sit in a single horizontal line rather than a grid —
         # cleaner and easier to scan at a glance.
-        size = getattr(self, "_btn_size_current", 190)
+        size = getattr(self, "_btn_size_current", px(190))
         for i, (key, icon, label, colour, hover, cmd) in enumerate(specs):
             btn = RoundButton(self.btn_frame, icon, label, colour, hover, cmd, size=size)
             btn.grid(row=0, column=i, padx=10, pady=8)
@@ -2200,7 +2249,24 @@ def main():
     try:
         ensure_desktop_shortcut()
         root = tk.Tk()
+
+        # Work out the real display scaling now that a window exists, and
+        # store it globally so every subsequently-built widget (fonts,
+        # button sizes, paddings — all computed via ui_font()/px()) scales
+        # to match. 96 DPI is Windows' 100% baseline; winfo_fpixels('1i')
+        # returns however many pixels actually make up one inch on this
+        # specific display right now, whatever its scaling is set to.
+        global DPI_SCALE
+        try:
+            measured = root.winfo_fpixels("1i") / 96.0
+            DPI_SCALE = max(0.75, min(3.0, measured))
+        except Exception:
+            DPI_SCALE = 1.0
+        log_event("APP", f"DPI scale detected: {DPI_SCALE:.2f}")
+
+        root.withdraw()   # avoid a flash of unscaled content while building
         SimpleApp(root)
+        root.deiconify()
         root.mainloop()
     except Exception as e:
         log_error("startup", e)
