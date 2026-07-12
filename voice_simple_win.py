@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -533,38 +533,108 @@ class Spinner(tk.Canvas):
 
 # ─── Settings window ──────────────────────────────────────────────────────────
 class SettingsWindow(tk.Toplevel):
-    def __init__(self, parent, cfg, on_save):
+    def __init__(self, parent, cfg, on_save, first_run=False):
         super().__init__(parent)
         self.title("Settings")
         self.configure(bg=C_BG)
         self.cfg = cfg
         self.on_save = on_save
-        self.geometry("420x420")
         self.transient(parent)
         self.grab_set()
 
+        # ── Size to fit the screen, same fix as the main window ──────────────
+        self.update_idletasks()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = min(480, screen_w - 80)
+        win_h = min(600, screen_h - 100)
+        win_w = max(win_w, 360)
+        win_h = max(win_h, 420)
+        x = (screen_w - win_w) // 2
+        y = max(20, (screen_h - win_h) // 2)
+        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self.minsize(340, 360)
+
+        outer = tk.Frame(self, bg=C_BG)
+        outer.pack(fill="both", expand=True)
+
+        # ── Button bar: fixed at the very bottom, ALWAYS visible ─────────────
+        # Packed first with side="bottom" so it keeps its spot no matter how
+        # tall the scrollable content above becomes.
+        btns = tk.Frame(outer, bg=C_BG)
+        btns.pack(side="bottom", fill="x", pady=12)
+        tk.Button(btns, text="Cancel", font=ui_font(11),
+                  command=self.destroy).pack(side="right", padx=10)
+        tk.Button(btns, text="Save", font=ui_font(11, bold=True),
+                  bg=C_GREEN, fg="white", padx=14, pady=4,
+                  command=self._save).pack(side="right")
+        tk.Button(btns, text="Remove this app", font=ui_font(9),
+                  fg=C_RED, bd=0, command=self._remove_app).pack(side="left", padx=10)
+
+        link_row = tk.Frame(outer, bg=C_BG)
+        link_row.pack(side="bottom", fill="x")
+        tk.Button(link_row, text="Open error report folder", font=ui_font(9),
+                  fg=C_MUTED, bd=0, cursor="hand2",
+                  command=self._open_logs).pack(side="left", padx=20, pady=(0,4))
+
+        # ── Scrollable content area ───────────────────────────────────────────
+        # Everything else lives inside a scrolling canvas, so if the screen
+        # is small or more settings get added later, you can always scroll to
+        # reach them — nothing can ever be silently cut off again.
+        canvas = tk.Canvas(outer, bg=C_BG, highlightthickness=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg=C_BG)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _on_body_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        body.bind("<Configure>", _on_body_configure)
+
+        def _on_canvas_configure(e):
+            canvas.itemconfig(body_id, width=e.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(e):
+            delta = -1 if e.delta > 0 else 1
+            if sys.platform.startswith("win"):
+                delta = -1 if e.delta > 0 else 1
+            canvas.yview_scroll(delta, "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # ── Settings fields (inside `body`, so they scroll) ───────────────────
         pad = {"padx": 20, "pady": 6}
 
-        tk.Label(self, text="Settings", font=ui_font(15, bold=True),
-                 bg=C_BG, fg=C_TEXT).pack(anchor="w", **pad)
+        if first_run:
+            welcome = tk.Label(body,
+                text="Welcome! Paste your Groq key below to get started.",
+                font=ui_font(12, bold=True), bg=C_BG, fg=C_GREEN,
+                wraplength=win_w-60, justify="left")
+            welcome.pack(anchor="w", padx=20, pady=(16, 4))
+        else:
+            tk.Label(body, text="Settings", font=ui_font(15, bold=True),
+                     bg=C_BG, fg=C_TEXT).pack(anchor="w", **pad)
 
-        tk.Label(self, text="Groq API key  (from console.groq.com)",
+        tk.Label(body, text="Groq API key  (from console.groq.com)",
                  font=ui_font(10), bg=C_BG, fg=C_MUTED).pack(anchor="w", padx=20)
         self.key_var = tk.StringVar(value=cfg.get("groq_api_key",""))
-        self.key_entry = tk.Entry(self, textvariable=self.key_var, show="*",
-                                  font=ui_font(11), width=40)
-        self.key_entry.pack(anchor="w", padx=20, pady=4)
+        self.key_entry = tk.Entry(body, textvariable=self.key_var, show="*",
+                                  font=ui_font(11), width=36)
+        self.key_entry.pack(anchor="w", padx=20, pady=4, fill="x")
 
         self.show_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(self, text="Show key", variable=self.show_var,
+        tk.Checkbutton(body, text="Show key", variable=self.show_var,
                        command=self._toggle_key, bg=C_BG,
                        font=ui_font(9)).pack(anchor="w", padx=20)
 
-        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=20, pady=10)
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
-        tk.Label(self, text="Which buttons should show?",
+        tk.Label(body, text="Which buttons should show?",
                  font=ui_font(12, bold=True), bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
-        tk.Label(self, text="The Record button always stays.",
+        tk.Label(body, text="The Record button always stays.",
                  font=ui_font(9), bg=C_BG, fg=C_MUTED).pack(anchor="w", padx=20)
 
         self.copy_var  = tk.BooleanVar(value=cfg.get("show_copy", True))
@@ -573,34 +643,25 @@ class SettingsWindow(tk.Toplevel):
         for text, var in [("Copy Text", self.copy_var),
                           ("Read Aloud", self.read_var),
                           ("Start Over", self.clear_var)]:
-            tk.Checkbutton(self, text=text, variable=var, bg=C_BG,
+            tk.Checkbutton(body, text=text, variable=var, bg=C_BG,
                            font=ui_font(11)).pack(anchor="w", padx=30, pady=2)
 
-        ttk.Separator(self, orient="horizontal").pack(fill="x", padx=20, pady=10)
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
         self.autotype_var = tk.BooleanVar(value=cfg.get("auto_type", True))
-        tk.Checkbutton(self, text="Type the words where I click (after recording)",
+        tk.Checkbutton(body, text="Type the words where I click (after recording)",
                        variable=self.autotype_var, bg=C_BG,
                        font=ui_font(11)).pack(anchor="w", padx=20, pady=2)
-        tk.Label(self, text="After it finishes, you get 5 seconds to click where\nthe words should go, then they type themselves.",
+        tk.Label(body, text="After it finishes, you get 5 seconds to click where\nthe words should go, then they type themselves.",
                  font=ui_font(9), bg=C_BG, fg=C_MUTED,
-                 justify="left").pack(anchor="w", padx=30)
+                 justify="left").pack(anchor="w", padx=30, pady=(0, 16))
 
-        btns = tk.Frame(self, bg=C_BG)
-        btns.pack(side="bottom", fill="x", pady=14)
-        tk.Button(btns, text="Cancel", font=ui_font(11),
-                  command=self.destroy).pack(side="right", padx=10)
-        tk.Button(btns, text="Save", font=ui_font(11, bold=True),
-                  bg=C_GREEN, fg="white", command=self._save).pack(side="right")
-
-        # Remove-app button, kept visually separate at the bottom-left
-        tk.Button(btns, text="Remove this app", font=ui_font(9),
-                  fg=C_RED, command=self._remove_app).pack(side="left", padx=10)
-
-        # Small link to open the error-report folder (for troubleshooting)
-        tk.Button(self, text="Open error report folder", font=ui_font(9),
-                  fg=C_MUTED, bd=0, cursor="hand2",
-                  command=self._open_logs).pack(side="bottom", anchor="w", padx=20)
+        if first_run:
+            # Big friendly first-run save button right in the flow too,
+            # in case the user doesn't scroll down to the bottom bar.
+            tk.Button(body, text="Save and start using the app",
+                     font=ui_font(12, bold=True), bg=C_GREEN, fg="white",
+                     padx=16, pady=8, command=self._save).pack(padx=20, pady=(0, 20))
 
     def _toggle_key(self):
         self.key_entry.config(show="" if self.show_var.get() else "*")
@@ -665,12 +726,42 @@ class SimpleApp:
 
         root.title("Voice to Text")
         root.configure(bg=C_BG)
-        root.geometry("720x840")
-        root.minsize(560, 740)
+
+        # ── Size the window to fit whatever screen it's actually on ──────────
+        # Fixed pixel sizes broke on smaller laptop screens (buttons and the
+        # Save button ended up rendered off-screen). This adapts instead.
+        root.update_idletasks()
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        # Leave room for the taskbar / window chrome
+        avail_h = screen_h - 90
+        avail_w = screen_w - 80
+        win_w = min(720, avail_w)
+        win_h = min(820, avail_h)
+        win_w = max(win_w, 480)   # never go below a sane minimum
+        win_h = max(win_h, 560)
+        x = (screen_w - win_w) // 2
+        y = max(20, (screen_h - win_h) // 2)
+        root.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        root.minsize(460, 520)
+
+        # Shrink the button size a little on very small screens so a full
+        # 2x2 grid always fits without needing to scroll.
+        self._btn_size = 200 if win_h >= 700 else (170 if win_h >= 600 else 150)
+
+        # Outer frame lets us guarantee the button row a spot at the very
+        # bottom of the window no matter how tall the text area wants to be.
+        outer = tk.Frame(root, bg=C_BG)
+        outer.pack(fill="both", expand=True)
+
+        # Button area — packed to the BOTTOM first, so it always keeps its
+        # spot even if the window is short. The text area fills what's left.
+        self.btn_frame = tk.Frame(outer, bg=C_BG)
+        self.btn_frame.pack(side="bottom", pady=14)
 
         # Top bar: wordmark left, gear right
-        top = tk.Frame(root, bg=C_BG)
-        top.pack(fill="x", padx=24, pady=(16, 0))
+        top = tk.Frame(outer, bg=C_BG)
+        top.pack(side="top", fill="x", padx=24, pady=(14, 0))
         title = tk.Label(top, text="Voice to Text", font=ui_font(17, bold=True),
                          bg=C_BG, fg=C_TEXT)
         title.pack(side="left")
@@ -681,19 +772,20 @@ class SimpleApp:
         gear.pack(side="right")
 
         # Status row: spinner + message side by side
-        status_row = tk.Frame(root, bg=C_BG)
-        status_row.pack(pady=10)
-        self.spinner = Spinner(status_row, size=40, width=5)
+        status_row = tk.Frame(outer, bg=C_BG)
+        status_row.pack(side="top", pady=8)
+        self.spinner = Spinner(status_row, size=36, width=5)
         self.spinner.pack(side="left", padx=(0, 10))
         self.spinner.stop()
         self.status_var = tk.StringVar(value="Press the green button and start talking")
         self.status_lbl = tk.Label(status_row, textvariable=self.status_var, font=STATUS_FONT,
-                                    bg=C_BG, fg=C_GREEN, wraplength=620)
+                                    bg=C_BG, fg=C_GREEN, wraplength=min(620, win_w-80))
         self.status_lbl.pack(side="left")
 
-        # Text area — white card with a soft hairline border
-        text_frame = tk.Frame(root, bg=C_BORDER, bd=0)
-        text_frame.pack(fill="both", expand=True, padx=24, pady=8)
+        # Text area — white card with a soft hairline border. Fills whatever
+        # vertical space remains between the status row and the buttons.
+        text_frame = tk.Frame(outer, bg=C_BORDER, bd=0)
+        text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
         inner = tk.Frame(text_frame, bg=C_SURFACE)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         self.text = tk.Text(inner, font=TEXT_FONT, wrap="word",
@@ -701,13 +793,13 @@ class SimpleApp:
                             insertbackground=C_TEXT, selectbackground="#d8e4dd")
         self.text.pack(fill="both", expand=True)
 
-        # Button area
-        self.btn_frame = tk.Frame(root, bg=C_BG)
-        self.btn_frame.pack(pady=18)
         self._build_buttons()
 
         if not self.cfg.get("groq_api_key"):
             self._set_status("Click the gear (top right) to add your Groq key", C_RED)
+            # First run with no key yet: pop the key entry straight up so
+            # there's no hunting for the gear icon.
+            self.root.after(300, self._open_settings_first_run)
 
     # ── Buttons ───────────────────────────────────────────────────────────────
     def _build_buttons(self):
@@ -724,14 +816,17 @@ class SimpleApp:
 
         cols = 1 if len(specs) == 1 else 2
         for i, (key, label, colour, hover, cmd) in enumerate(specs):
-            btn = RoundButton(self.btn_frame, label, colour, hover, cmd, size=200)
+            btn = RoundButton(self.btn_frame, label, colour, hover, cmd, size=self._btn_size)
             r, c = divmod(i, cols)
-            btn.grid(row=r, column=c, padx=10, pady=10)
+            btn.grid(row=r, column=c, padx=8, pady=8)
             if key == "record":
                 self.record_btn = btn
 
     def _open_settings(self):
         SettingsWindow(self.root, self.cfg, on_save=self._after_settings)
+
+    def _open_settings_first_run(self):
+        SettingsWindow(self.root, self.cfg, on_save=self._after_settings, first_run=True)
 
     def _after_settings(self):
         self._build_buttons()
