@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "3.1.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -107,6 +107,85 @@ def safe_thread(fn):
         except Exception as e:
             log_error(f"thread:{fn.__name__}", e)
     return wrapper
+
+# ─── Activity log ─────────────────────────────────────────────────────────────
+# A running record of what the app is doing — button clicks, recordings,
+# transcription results, mic tests — so that if something looks wrong, the
+# exact sequence of events can be copied and sent for diagnosis, instead of
+# just "it didn't work".
+ACTIVITY_LOG = CONFIG_DIR / "activity_log.txt"
+_ACTIVITY_MAX_LINES = 800   # keep the file from growing forever
+
+def log_event(category, message):
+    """Append one line to the activity log: [HH:MM:SS] CATEGORY: message"""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        line = f"[{_dt.datetime.now().strftime('%H:%M:%S')}] {category}: {message}\n"
+        with open(ACTIVITY_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+        _trim_activity_log()
+    except Exception:
+        pass  # logging must never crash the app
+
+def _trim_activity_log():
+    """Keep the activity log to a reasonable size by dropping old lines."""
+    try:
+        if not ACTIVITY_LOG.exists():
+            return
+        with open(ACTIVITY_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        if len(lines) > _ACTIVITY_MAX_LINES:
+            with open(ACTIVITY_LOG, "w", encoding="utf-8") as f:
+                f.writelines(lines[-_ACTIVITY_MAX_LINES:])
+    except Exception:
+        pass
+
+def build_full_report():
+    """
+    Assemble one combined, copyable report: system info, the activity log,
+    and the tail of the crash log. This is what the Settings 'Report' box
+    shows and what gets copied to the clipboard.
+    """
+    parts = []
+    parts.append("=" * 50)
+    parts.append("VOICE TO TEXT — DIAGNOSTIC REPORT")
+    parts.append("=" * 50)
+    parts.append(f"Version:   {APP_VERSION}")
+    parts.append(f"Platform:  {sys.platform}")
+    parts.append(f"Python:    {sys.version.split()[0]}")
+    parts.append(f"Generated: {_dt.datetime.now().isoformat()}")
+    parts.append("")
+    parts.append("-" * 50)
+    parts.append("RECENT ACTIVITY")
+    parts.append("-" * 50)
+    try:
+        if ACTIVITY_LOG.exists():
+            with open(ACTIVITY_LOG, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            parts.append("".join(lines[-150:]).rstrip() or "(no activity recorded yet)")
+        else:
+            parts.append("(no activity recorded yet)")
+    except Exception as e:
+        parts.append(f"(couldn't read activity log: {e})")
+
+    parts.append("")
+    parts.append("-" * 50)
+    parts.append("RECENT ERRORS")
+    parts.append("-" * 50)
+    try:
+        if CRASH_LOG.exists():
+            with open(CRASH_LOG, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            # Keep just the last few error blocks so the report isn't huge
+            blocks = content.split("=" * 60)
+            tail = "=" * 60 + ("=" * 60).join(blocks[-3:]) if len(blocks) > 1 else content
+            parts.append(tail.strip() or "(no errors recorded)")
+        else:
+            parts.append("(no errors recorded)")
+    except Exception as e:
+        parts.append(f"(couldn't read crash log: {e})")
+
+    return "\n".join(parts)
 
 
 DEFAULT_CONFIG = {
@@ -228,12 +307,23 @@ class AudioRecorder:
         self.chunk, self.fmt = 1024, pyaudio.paInt16
         self._frames, self._recording = [], False
         self._pa = self._stream = self._thread = None
+        self.open_error = None   # set if the mic couldn't be opened at all
 
     def start(self):
         self._frames, self._recording = [], True
-        self._pa = pyaudio.PyAudio()
-        self._stream = self._pa.open(format=self.fmt, channels=self.channels,
-                                     rate=self.rate, input=True, frames_per_buffer=self.chunk)
+        self.open_error = None
+        try:
+            self._pa = pyaudio.PyAudio()
+            self._stream = self._pa.open(format=self.fmt, channels=self.channels,
+                                         rate=self.rate, input=True,
+                                         frames_per_buffer=self.chunk)
+        except Exception as e:
+            # Couldn't even open the microphone — usually a permissions or
+            # device problem, not "no speech". Record this distinctly.
+            self.open_error = str(e)
+            self._recording = False
+            log_error("AudioRecorder.start", e)
+            return
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -241,7 +331,8 @@ class AudioRecorder:
         while self._recording:
             try:
                 self._frames.append(self._stream.read(self.chunk, exception_on_overflow=False))
-            except Exception:
+            except Exception as e:
+                log_error("AudioRecorder._loop", e)
                 break
 
     def stop(self):
@@ -274,7 +365,6 @@ class AudioRecorder:
         if not samples:
             return 0, 0
         peak = max(abs(s) for s in samples)
-        # RMS
         sq = sum(s*s for s in samples) / count
         rms = int(sq ** 0.5)
         return rms, peak
@@ -284,6 +374,25 @@ class AudioRecorder:
             return True
         rms, peak = self._rms_and_peak()
         return rms < 120 and peak < 900
+
+    def silence_kind(self):
+        """
+        Distinguish a genuinely quiet recording from one where Windows (or
+        another OS) is blocking microphone access. When access is blocked,
+        the stream typically still "succeeds" but every sample comes back
+        as exact zero — never even room tone or a breath. That's a strong
+        signal it's a permissions problem, not "please talk louder".
+        Returns: 'ok' (had real audio), 'quiet' (low but plausible), or
+        'blocked' (looks like no real signal ever reached the app).
+        """
+        if not self._frames:
+            return "blocked"
+        rms, peak = self._rms_and_peak()
+        if peak == 0:
+            return "blocked"
+        if rms < 120 and peak < 900:
+            return "quiet"
+        return "ok"
 
     # ── Streaming support ─────────────────────────────────────────────────────
     def frame_count(self):
@@ -427,20 +536,22 @@ STATUS_FONT = ui_font(14, bold=True)
 # ─── Rounded button (canvas-drawn, hover + pulse ring) ────────────────────────
 class RoundButton(tk.Canvas):
     """A modern rounded square button drawn on a canvas.
-    Supports hover colour, label updates, colour changes, and a pulsing
-    ring (used while recording)."""
-    RADIUS = 26
+    Draws an actual vector icon (not a text glyph — those render
+    inconsistently across fonts/platforms and were the cause of the
+    misaligned-looking buttons) plus a label underneath, both centered.
+    Supports hover colour, resizing, and a pulsing ring while recording."""
+    RADIUS_FRAC = 0.13   # corner radius as a fraction of the button size
 
-    def __init__(self, parent, label, colour, hover, command,
-                 size=200, font=None, bg=None):
+    def __init__(self, parent, icon, label, colour, hover, command,
+                 size=200, bg=None):
         super().__init__(parent, width=size, height=size,
                          bg=bg or C_BG, highlightthickness=0, cursor="hand2")
         self._size = size
+        self._icon = icon          # one of: record, stop, copy, read, clear
         self._colour = colour
         self._hover = hover
         self._command = command
         self._label_text = label
-        self._font = font or BTN_FONT
         self._pulse_on = False
         self._pulse_step = 0
 
@@ -454,25 +565,97 @@ class RoundButton(tk.Canvas):
                x1-r,y1, x0+r,y1, x0,y1, x0,y1-r, x0,y0+r, x0,y0]
         return self.create_polygon(pts, smooth=True, **kw)
 
+    # ── Icon drawing (vector, so it always looks crisp and centered) ─────────
+    def _draw_icon(self, cx, cy, r, white="white"):
+        ic = self._icon
+        if ic == "record":
+            self.create_oval(cx-r, cy-r, cx+r, cy+r, fill=white, outline="")
+        elif ic == "stop":
+            k = r*0.86
+            self.create_rectangle(cx-k, cy-k, cx+k, cy+k, fill=white, outline="")
+        elif ic == "copy":
+            w, h = r*1.15, r*1.4
+            off = r*0.32
+            lw = max(2, int(r*0.14))
+            # back sheet
+            self._rounded_rect(cx-w/2+off, cy-h/2-off, cx+w/2+off, cy+h/2-off,
+                               r*0.22, fill="", outline=white, width=lw)
+            # front sheet (filled background colour to "cut" the overlap)
+            self._rounded_rect(cx-w/2-off, cy-h/2+off, cx+w/2-off, cy+h/2+off,
+                               r*0.22, fill=self._current_fill, outline=white, width=lw)
+        elif ic == "read":
+            # Speaker body (polygon) + two sound-wave arcs
+            bw, bh = r*0.55, r*0.9
+            self.create_polygon(
+                cx-r*0.95, cy-bh*0.32, cx-r*0.95+bw*0.5, cy-bh*0.32,
+                cx-r*0.15, cy-bh, cx-r*0.15, cy+bh,
+                cx-r*0.95+bw*0.5, cy+bh*0.32, cx-r*0.95, cy+bh*0.32,
+                fill=white, outline="")
+            lw = max(2, int(r*0.13))
+            self.create_arc(cx-r*0.15, cy-r*0.55, cx+r*0.55, cy+r*0.55,
+                            start=-55, extent=110, style="arc", outline=white, width=lw)
+            self.create_arc(cx-r*0.15, cy-r*0.95, cx+r*0.95, cy+r*0.95,
+                            start=-50, extent=100, style="arc", outline=white, width=lw)
+        elif ic == "clear":
+            # Circular arrow (refresh / start over)
+            lw = max(2, int(r*0.16))
+            self.create_arc(cx-r*0.85, cy-r*0.85, cx+r*0.85, cy+r*0.85,
+                            start=40, extent=280, style="arc", outline=white, width=lw)
+            # Arrowhead at the open end (~40 degrees)
+            import math
+            ang = math.radians(40)
+            ax = cx + r*0.85*math.cos(ang)
+            ay = cy - r*0.85*math.sin(ang)
+            self.create_polygon(
+                ax, ay-r*0.28, ax+r*0.30, ay+r*0.06, ax-r*0.14, ay+r*0.26,
+                fill=white, outline="")
+
     def _draw(self, fill):
+        self._current_fill = fill
         self.delete("all")
         s = self._size
-        pad = 10  # leave room for the pulse ring
-        # Pulse ring (drawn first, behind the button)
+        pad = max(8, int(s*0.05))
+        radius = max(10, s * self.RADIUS_FRAC)
+
         if self._pulse_on:
             ring_pad = pad - 6 + (self._pulse_step % 3) * 2
+            ring_pad = max(2, ring_pad)
             self._rounded_rect(ring_pad, ring_pad, s-ring_pad, s-ring_pad,
-                               self.RADIUS+6, fill="", outline=self._colour,
-                               width=3)
-        self._rounded_rect(pad, pad, s-pad, s-pad, self.RADIUS, fill=fill, outline="")
-        self.create_text(s/2, s/2, text=self._label_text, font=self._font,
-                         fill="white", justify="center")
-        self._current_fill = fill
+                               radius+6, fill="", outline=self._colour, width=3)
 
-    def set(self, label=None, colour=None, hover=None):
+        self._rounded_rect(pad, pad, s-pad, s-pad, radius, fill=fill, outline="")
+
+        # Icon centered in the upper-middle, label below it — both as one
+        # visually balanced unit, vertically centered as a group within
+        # the button (this replaces the old single centered text glyph).
+        icon_r = s * 0.13
+        font_size = max(9, int(s * 0.082))
+        label_h = font_size * 2.5   # reserve room for up to 2 wrapped lines
+        gap = s * 0.06
+        group_h = icon_r*2 + gap + label_h
+        top = s/2 - group_h/2
+        icon_cy = top + icon_r
+        label_cy = top + icon_r*2 + gap + label_h/2
+
+        self._draw_icon(s/2, icon_cy, icon_r)
+
+        fam = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
+        self.create_text(s/2, label_cy, text=self._label_text,
+                         font=(fam, font_size, "bold"), fill="white",
+                         justify="center", width=int(s*0.82))
+
+    def set(self, label=None, icon=None, colour=None, hover=None):
         if label is not None:  self._label_text = label
+        if icon is not None:   self._icon = icon
         if colour is not None: self._colour = colour
         if hover is not None:  self._hover = hover
+        self._draw(self._colour)
+
+    def resize(self, new_size):
+        if new_size == self._size:
+            return
+        self._size = new_size
+        self.config(width=new_size, height=new_size)
         self._draw(self._colour)
 
     def pulse_start(self):
@@ -632,6 +815,41 @@ class SettingsWindow(tk.Toplevel):
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
+        # ── Microphone test ────────────────────────────────────────────────
+        tk.Label(body, text="Microphone", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="If Record keeps saying it can't hear anything, test\n"
+                      "the microphone here first.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED,
+                 justify="left").pack(anchor="w", padx=20)
+
+        mic_row = tk.Frame(body, bg=C_BG)
+        mic_row.pack(anchor="w", padx=20, pady=6, fill="x")
+        self.mic_test_btn = tk.Button(mic_row, text="Test Microphone",
+                                      font=ui_font(10, bold=True),
+                                      bg=C_BLUE, fg="white", padx=10, pady=4,
+                                      command=self._test_microphone)
+        self.mic_test_btn.pack(side="left")
+
+        # Live level meter (a thin canvas bar)
+        self.mic_meter = tk.Canvas(mic_row, width=180, height=18, bg="#eeece5",
+                                   highlightthickness=1, highlightbackground=C_BORDER)
+        self.mic_meter.pack(side="left", padx=10)
+        self._mic_meter_fill = None
+
+        self.mic_status_lbl = tk.Label(body, text="", font=ui_font(9),
+                                       bg=C_BG, fg=C_MUTED, justify="left",
+                                       wraplength=win_w-60)
+        self.mic_status_lbl.pack(anchor="w", padx=20)
+
+        if sys.platform.startswith("win"):
+            tk.Button(body, text="Open Windows Microphone Settings",
+                     font=ui_font(9), fg=C_BLUE, bd=0, cursor="hand2",
+                     command=self._open_mic_privacy).pack(anchor="w", padx=20, pady=(2,0))
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
         tk.Label(body, text="Which buttons should show?",
                  font=ui_font(12, bold=True), bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
         tk.Label(body, text="The Record button always stays.",
@@ -656,6 +874,43 @@ class SettingsWindow(tk.Toplevel):
                  font=ui_font(9), bg=C_BG, fg=C_MUTED,
                  justify="left").pack(anchor="w", padx=30, pady=(0, 16))
 
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
+        # ── Diagnostic report: copyable activity + error log ─────────────────
+        tk.Label(body, text="Activity & Error Report", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="Shows what the app has been doing — button clicks, "
+                      "recordings, and any errors. If something looks wrong, "
+                      "copy this and send it over.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-60).pack(anchor="w", padx=20)
+
+        report_frame = tk.Frame(body, bg=C_BORDER)
+        report_frame.pack(fill="both", padx=20, pady=6)
+        self.report_text = tk.Text(report_frame, height=8, font=("Consolas" if
+                                   sys.platform.startswith("win") else "Courier", 9),
+                                   wrap="word", bg="#fbfaf7", fg=C_TEXT, bd=0,
+                                   padx=8, pady=8)
+        report_scroll = ttk.Scrollbar(report_frame, orient="vertical",
+                                      command=self.report_text.yview)
+        self.report_text.configure(yscrollcommand=report_scroll.set)
+        self.report_text.pack(side="left", fill="both", expand=True, padx=1, pady=1)
+        report_scroll.pack(side="right", fill="y")
+
+        report_btn_row = tk.Frame(body, bg=C_BG)
+        report_btn_row.pack(anchor="w", padx=20, pady=(0, 6))
+        tk.Button(report_btn_row, text="Refresh", font=ui_font(9),
+                 command=self._refresh_report).pack(side="left", padx=(0, 8))
+        tk.Button(report_btn_row, text="Copy Report to Clipboard",
+                 font=ui_font(9, bold=True), bg=C_BLUE, fg="white",
+                 command=self._copy_report).pack(side="left")
+        self.report_copied_lbl = tk.Label(report_btn_row, text="", font=ui_font(9),
+                                          bg=C_BG, fg=C_GREEN)
+        self.report_copied_lbl.pack(side="left", padx=10)
+
+        self._refresh_report()
+
         if first_run:
             # Big friendly first-run save button right in the flow too,
             # in case the user doesn't scroll down to the bottom bar.
@@ -663,8 +918,103 @@ class SettingsWindow(tk.Toplevel):
                      font=ui_font(12, bold=True), bg=C_GREEN, fg="white",
                      padx=16, pady=8, command=self._save).pack(padx=20, pady=(0, 20))
 
+    def _refresh_report(self):
+        try:
+            report = build_full_report()
+        except Exception as e:
+            report = f"(couldn't build report: {e})"
+        self.report_text.delete("1.0", "end")
+        self.report_text.insert("1.0", report)
+
+    def _copy_report(self):
+        try:
+            report = self.report_text.get("1.0", "end").strip()
+            self.clipboard_clear()
+            self.clipboard_append(report)
+            self.report_copied_lbl.config(text="Copied!")
+            self.after(2000, lambda: self.report_copied_lbl.config(text=""))
+        except Exception as e:
+            log_error("copy_report", e)
+
     def _toggle_key(self):
         self.key_entry.config(show="" if self.show_var.get() else "*")
+
+    def _open_mic_privacy(self):
+        try:
+            os.startfile("ms-settings:privacy-microphone")
+        except Exception as e:
+            log_error("open_mic_privacy", e)
+
+    def _test_microphone(self):
+        """Record 3 seconds and show a live level meter, so it's obvious
+        whether audio is reaching the app at all — the key diagnostic for
+        Windows microphone-permission problems."""
+        log_event("BUTTON", "Test Microphone clicked")
+        self.mic_test_btn.config(state="disabled", text="Listening...")
+        self.mic_status_lbl.config(text="Make some noise or talk for a moment...", fg=C_BLUE)
+        rec = AudioRecorder(self.cfg.get("sample_rate", 16000), self.cfg.get("channels", 1))
+        rec.start()
+
+        if rec.open_error:
+            log_event("MIC_TEST", f"failed to open — {rec.open_error}")
+            self.mic_test_btn.config(state="normal", text="Test Microphone")
+            self.mic_status_lbl.config(
+                text="Couldn't open the microphone at all. This usually means "
+                     "Windows is blocking it for this app. Click the blue link "
+                     "above to open Microphone Settings, then make sure "
+                     "'Microphone access' and 'Let desktop apps access your "
+                     "microphone' are both turned ON.",
+                fg=C_RED)
+            return
+
+        self._mic_test_start = time.time()
+        self._mic_test_recorder = rec
+        self._update_mic_meter()
+
+    def _update_mic_meter(self):
+        rec = getattr(self, "_mic_test_recorder", None)
+        if not rec:
+            return
+        elapsed = time.time() - self._mic_test_start
+        # Read the most recent short window of audio for a responsive meter
+        n = rec.frame_count()
+        recent = rec.slice_bytes(max(0, n-4), n)
+        level = _bytes_rms(recent) if recent else 0
+        # Scale roughly 0..4000 to 0..1
+        frac = max(0.0, min(1.0, level / 4000.0))
+        self.mic_meter.delete("all")
+        w = int(176 * frac)
+        colour = C_GREEN if frac > 0.05 else C_BORDER
+        if w > 0:
+            self.mic_meter.create_rectangle(2, 2, 2+w, 16, fill=colour, outline="")
+
+        if elapsed >= 3.0:
+            rec.stop()
+            kind = rec.silence_kind()
+            log_event("MIC_TEST", f"result: {kind}")
+            self.mic_test_btn.config(state="normal", text="Test Microphone")
+            if kind == "blocked":
+                self.mic_status_lbl.config(
+                    text="No sound reached the app at all, even though the "
+                         "microphone opened. This is almost always a Windows "
+                         "permission setting. Click the blue link above, then "
+                         "turn on microphone access for desktop apps.",
+                    fg=C_RED)
+            elif kind == "quiet":
+                self.mic_status_lbl.config(
+                    text="Only very quiet sound was picked up. Try moving "
+                         "closer to the microphone, or check the right "
+                         "microphone is selected as default in Windows sound "
+                         "settings.",
+                    fg=C_MUTED)
+            else:
+                self.mic_status_lbl.config(
+                    text="The microphone is working — sound is reaching the app.",
+                    fg=C_GREEN)
+            self._mic_test_recorder = None
+            return
+
+        self.after(100, self._update_mic_meter)
 
     def _open_logs(self):
         try:
@@ -712,6 +1062,7 @@ class SettingsWindow(tk.Toplevel):
 # ─── Main window ──────────────────────────────────────────────────────────────
 class SimpleApp:
     def __init__(self, root):
+        log_event("APP", f"started — version {APP_VERSION}, platform {sys.platform}")
         self.root = root
         self.cfg = load_config()
         self.recorder = AudioRecorder(self.cfg["sample_rate"], self.cfg["channels"])
@@ -723,70 +1074,77 @@ class SimpleApp:
         self._seg_lock = threading.Lock()
         self._seg_index = 0
         self._seg_cut = 0
+        self._compact = False
+        self._full_height = None   # remembered so "Full view" can restore it
+        self._resize_job = None
+        self._buttons = []         # list of (key, RoundButton)
 
         root.title("Voice to Text")
         root.configure(bg=C_BG)
+        root.resizable(True, True)
 
         # ── Size the window to fit whatever screen it's actually on ──────────
-        # Fixed pixel sizes broke on smaller laptop screens (buttons and the
-        # Save button ended up rendered off-screen). This adapts instead.
         root.update_idletasks()
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
-        # Leave room for the taskbar / window chrome
         avail_h = screen_h - 90
         avail_w = screen_w - 80
         win_w = min(720, avail_w)
         win_h = min(820, avail_h)
-        win_w = max(win_w, 480)   # never go below a sane minimum
-        win_h = max(win_h, 560)
+        win_w = max(win_w, 420)
+        win_h = max(win_h, 480)
         x = (screen_w - win_w) // 2
         y = max(20, (screen_h - win_h) // 2)
         root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        root.minsize(460, 520)
-
-        # Shrink the button size a little on very small screens so a full
-        # 2x2 grid always fits without needing to scroll.
-        self._btn_size = 200 if win_h >= 700 else (170 if win_h >= 600 else 150)
+        root.minsize(360, 420)
+        self._full_height = win_h
 
         # Outer frame lets us guarantee the button row a spot at the very
         # bottom of the window no matter how tall the text area wants to be.
         outer = tk.Frame(root, bg=C_BG)
         outer.pack(fill="both", expand=True)
+        self._outer = outer
 
         # Button area — packed to the BOTTOM first, so it always keeps its
         # spot even if the window is short. The text area fills what's left.
         self.btn_frame = tk.Frame(outer, bg=C_BG)
         self.btn_frame.pack(side="bottom", pady=14)
 
-        # Top bar: wordmark left, gear right
+        # Top bar: wordmark left, compact-toggle + gear right
         top = tk.Frame(outer, bg=C_BG)
         top.pack(side="top", fill="x", padx=24, pady=(14, 0))
         title = tk.Label(top, text="Voice to Text", font=ui_font(17, bold=True),
                          bg=C_BG, fg=C_TEXT)
         title.pack(side="left")
+
         gear = tk.Button(top, text="\u2699", font=ui_font(16), bd=0,
                          bg=C_BG, fg=C_MUTED, activebackground=C_BG,
                          activeforeground=C_TEXT,
                          cursor="hand2", command=self._open_settings)
         gear.pack(side="right")
 
+        self.compact_btn = tk.Button(top, text="Compact view", font=ui_font(9),
+                         bd=0, bg=C_BG, fg=C_MUTED, activebackground=C_BG,
+                         activeforeground=C_TEXT, cursor="hand2",
+                         command=self._toggle_compact)
+        self.compact_btn.pack(side="right", padx=(0, 14))
+
         # Status row: spinner + message side by side
-        status_row = tk.Frame(outer, bg=C_BG)
-        status_row.pack(side="top", pady=8)
-        self.spinner = Spinner(status_row, size=36, width=5)
+        self.status_row = tk.Frame(outer, bg=C_BG)
+        self.status_row.pack(side="top", pady=8)
+        self.spinner = Spinner(self.status_row, size=36, width=5)
         self.spinner.pack(side="left", padx=(0, 10))
         self.spinner.stop()
         self.status_var = tk.StringVar(value="Press the green button and start talking")
-        self.status_lbl = tk.Label(status_row, textvariable=self.status_var, font=STATUS_FONT,
+        self.status_lbl = tk.Label(self.status_row, textvariable=self.status_var, font=STATUS_FONT,
                                     bg=C_BG, fg=C_GREEN, wraplength=min(620, win_w-80))
         self.status_lbl.pack(side="left")
 
         # Text area — white card with a soft hairline border. Fills whatever
         # vertical space remains between the status row and the buttons.
-        text_frame = tk.Frame(outer, bg=C_BORDER, bd=0)
-        text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
-        inner = tk.Frame(text_frame, bg=C_SURFACE)
+        self.text_frame = tk.Frame(outer, bg=C_BORDER, bd=0)
+        self.text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
+        inner = tk.Frame(self.text_frame, bg=C_SURFACE)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         self.text = tk.Text(inner, font=TEXT_FONT, wrap="word",
                             fg=C_TEXT, bg=C_SURFACE, bd=0, padx=20, pady=18,
@@ -795,40 +1153,125 @@ class SimpleApp:
 
         self._build_buttons()
 
+        # Recompute button sizing whenever the window is resized, so the
+        # layout genuinely adapts instead of being fixed at startup.
+        root.bind("<Configure>", self._on_window_configure)
+
         if not self.cfg.get("groq_api_key"):
             self._set_status("Click the gear (top right) to add your Groq key", C_RED)
-            # First run with no key yet: pop the key entry straight up so
-            # there's no hunting for the gear icon.
             self.root.after(300, self._open_settings_first_run)
+
+    # ── Responsive layout ────────────────────────────────────────────────────
+    def _on_window_configure(self, event):
+        # Only react to the root window itself resizing, and debounce so we
+        # don't recompute on every pixel while the user drags the edge.
+        if event.widget is not self.root:
+            return
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(120, self._apply_responsive_size)
+
+    def _apply_responsive_size(self):
+        self._resize_job = None
+        if not self._buttons:
+            return
+        win_w = self.root.winfo_width()
+        win_h = self.root.winfo_height()
+        if win_w < 50 or win_h < 50:
+            return  # window not really laid out yet
+
+        n = len(self._buttons)
+        cols = 1 if n == 1 else 2
+        rows = (n + cols - 1) // cols
+        gap = 16
+
+        avail_w = win_w - 48
+        max_w = (avail_w - (cols-1)*gap) / cols
+
+        if self._compact:
+            # In compact mode the buttons ARE the window, so let them use
+            # most of the available height too.
+            avail_h = win_h - 60
+        else:
+            # Leave most of the height for the text area, but don't starve
+            # the buttons on ordinary laptop screens.
+            avail_h = win_h * 0.48
+        max_h = (avail_h - (rows-1)*gap) / rows
+
+        new_size = int(max(120, min(210, max_w, max_h)))
+        self._btn_size_current = new_size
+
+        for _, btn in self._buttons:
+            btn.resize(new_size)
+
+        wrap = max(200, min(620, win_w - 80))
+        self.status_lbl.config(wraplength=wrap)
+
+    # ── Compact / full view toggle ───────────────────────────────────────────
+    def _toggle_compact(self):
+        self._compact = not self._compact
+        log_event("BUTTON", f"view toggled -> {'compact' if self._compact else 'full'}")
+        if self._compact:
+            self._full_height = self.root.winfo_height()
+            self.status_row.pack_forget()
+            self.text_frame.pack_forget()
+            self.compact_btn.config(text="Full view")
+            # Shrink the window to just fit the top bar + buttons
+            self.root.update_idletasks()
+            new_h = self.btn_frame.winfo_reqheight() + \
+                    self._outer.winfo_children()[1].winfo_reqheight() + 40
+            win_w = self.root.winfo_width()
+            self.root.geometry(f"{win_w}x{max(220, new_h)}")
+            self.root.minsize(300, 200)
+        else:
+            self.status_row.pack(side="top", pady=8)
+            self.text_frame.pack(side="top", fill="both", expand=True, padx=24, pady=6)
+            self.compact_btn.config(text="Compact view")
+            win_w = self.root.winfo_width()
+            self.root.geometry(f"{win_w}x{self._full_height or 700}")
+            self.root.minsize(360, 420)
+        self.root.after(150, self._apply_responsive_size)
 
     # ── Buttons ───────────────────────────────────────────────────────────────
     def _build_buttons(self):
         for child in self.btn_frame.winfo_children():
             child.destroy()
+        self._buttons = []
 
-        specs = [("record", "\u25cf  RECORD", C_GREEN, C_GREEN_H, self._on_record)]
+        specs = [("record", "record", "RECORD", C_GREEN, C_GREEN_H, self._on_record)]
         if self.cfg.get("show_copy", True):
-            specs.append(("copy", "COPY\nTEXT", C_BLUE, C_BLUE_H, self._on_copy))
+            specs.append(("copy", "copy", "COPY TEXT", C_BLUE, C_BLUE_H, self._on_copy))
         if self.cfg.get("show_read", True):
-            specs.append(("read", "READ\nALOUD", C_PURPLE, C_PURPLE_H, self._on_read))
+            specs.append(("read", "read", "READ ALOUD", C_PURPLE, C_PURPLE_H, self._on_read))
         if self.cfg.get("show_clear", True):
-            specs.append(("clear", "START\nOVER", C_GREY, C_GREY_H, self._on_clear))
+            specs.append(("clear", "clear", "START OVER", C_GREY, C_GREY_H, self._on_clear))
 
         cols = 1 if len(specs) == 1 else 2
-        for i, (key, label, colour, hover, cmd) in enumerate(specs):
-            btn = RoundButton(self.btn_frame, label, colour, hover, cmd, size=self._btn_size)
+        size = getattr(self, "_btn_size_current", 190)
+        for i, (key, icon, label, colour, hover, cmd) in enumerate(specs):
+            btn = RoundButton(self.btn_frame, icon, label, colour, hover, cmd, size=size)
             r, c = divmod(i, cols)
             btn.grid(row=r, column=c, padx=8, pady=8)
+            self._buttons.append((key, btn))
             if key == "record":
                 self.record_btn = btn
 
+        self.root.after(50, self._apply_responsive_size)
+
     def _open_settings(self):
+        log_event("BUTTON", "Settings (gear) clicked")
         SettingsWindow(self.root, self.cfg, on_save=self._after_settings)
 
     def _open_settings_first_run(self):
+        log_event("APP", "first-run settings popup shown (no key set)")
         SettingsWindow(self.root, self.cfg, on_save=self._after_settings, first_run=True)
 
     def _after_settings(self):
+        log_event("SETTINGS", "saved — "
+                  f"buttons: copy={self.cfg.get('show_copy')} "
+                  f"read={self.cfg.get('show_read')} "
+                  f"clear={self.cfg.get('show_clear')}, "
+                  f"auto_type={self.cfg.get('auto_type')}")
         self._build_buttons()
         if self.cfg.get("groq_api_key"):
             self._set_status("Ready. Press the green button and start talking", C_GREEN)
@@ -841,14 +1284,31 @@ class SimpleApp:
             self._start_recording()
 
     def _start_recording(self):
+        log_event("BUTTON", "Record clicked (start)")
         if self._processing:
+            log_event("RECORD", "ignored — still processing previous recording")
             return
         if not self.cfg.get("groq_api_key"):
+            log_event("RECORD", "blocked — no Groq API key set")
             self._set_status("Please add your Groq key first (gear, top right)", C_RED)
             return
         self._recording = True
         self.recorder.start()
-        self.record_btn.set(label="\u25a0  STOP", colour=C_RED, hover=C_RED_H)
+
+        if self.recorder.open_error:
+            # The microphone couldn't be opened at all — almost always a
+            # Windows permissions problem, not "no speech". Say so clearly.
+            log_event("MIC", f"failed to open — {self.recorder.open_error}")
+            self._recording = False
+            self.record_btn.pulse_stop()
+            self.record_btn.set(icon="record", label="RECORD", colour=C_GREEN, hover=C_GREEN_H)
+            self._set_status(
+                "Can't reach the microphone — check the gear for Microphone help",
+                C_RED)
+            return
+
+        log_event("RECORD", "started listening")
+        self.record_btn.set(icon="stop", label="STOP", colour=C_RED, hover=C_RED_H)
         self.record_btn.pulse_start()
         self._set_status("Listening... press STOP when you are done", C_RED)
 
@@ -899,9 +1359,22 @@ class SimpleApp:
         self._recording = False
         self.recorder.stop()
         self.record_btn.pulse_stop()
-        self.record_btn.set(label="\u25cf  RECORD", colour=C_GREEN, hover=C_GREEN_H)
+        self.record_btn.set(icon="record", label="RECORD", colour=C_GREEN, hover=C_GREEN_H)
+        dur = self.recorder.duration()
+        log_event("BUTTON", f"Record clicked (stop) — recorded {dur:.1f}s")
 
-        if self.recorder.duration() < 0.4 or self.recorder.is_mostly_silent():
+        if dur < 0.4:
+            log_event("RECORD", "too short, discarded")
+            self._set_status("That was too quick — please try again", C_MUTED)
+            return
+        kind = self.recorder.silence_kind()
+        log_event("RECORD", f"silence check: {kind}")
+        if kind == "blocked":
+            self._set_status(
+                "No sound reached the app — check the gear for Microphone help",
+                C_RED)
+            return
+        if kind == "quiet":
             self._set_status("I didn't hear anything — please try again", C_MUTED)
             return
 
@@ -927,26 +1400,38 @@ class SimpleApp:
                          for i in range(self._seg_index)]
             raw = " ".join(p for p in parts if p).strip()
             raw = re.sub(r"\s{2,}", " ", raw)
+            log_event("TRANSCRIBE", f"{self._seg_index} segment(s) -> "
+                                    f"{len(raw)} chars: \"{raw[:80]}"
+                                    f"{'...' if len(raw) > 80 else ''}\"")
 
             if not raw or is_probable_hallucination(raw):
+                log_event("TRANSCRIBE", "empty or hallucination-filtered — discarded")
                 self._set_status("I didn't catch any words — please try again", C_MUTED)
                 return
 
             self._spin_start(C_PURPLE)
             self._set_status("Tidying it up...", C_PURPLE)
+            provider = self.cfg.get("ai_provider", "groq") if self.cfg.get("ai_cleanup") else "none"
+            log_event("CLEANUP", f"provider={provider}")
             cleaned = ai_cleanup(raw, self.cfg)
+            log_event("CLEANUP", f"result: {len(cleaned)} chars: \"{cleaned[:80]}"
+                                 f"{'...' if len(cleaned) > 80 else ''}\"")
             if not cleaned.strip() or is_probable_hallucination(cleaned):
+                log_event("CLEANUP", "empty or hallucination-filtered after cleanup — discarded")
                 self._set_status("I didn't catch that clearly — please try again", C_MUTED)
                 return
 
             self._append_text(cleaned)
 
             if self.cfg.get("auto_type", True):
+                log_event("TYPE", "auto-type enabled — starting countdown")
                 self._countdown_and_type(cleaned)
             else:
+                log_event("DONE", "text ready (auto-type off)")
                 self._set_status("Done! You can record more, copy, or read it aloud", C_GREEN)
         except Exception as e:
             log_error("_process", e)
+            log_event("ERROR", f"_process failed: {type(e).__name__}: {e}")
             msg = "Something went wrong — please try again"
             if "api" in str(e).lower() or "key" in str(e).lower() or "401" in str(e):
                 msg = "There may be a problem with the Groq key (check the gear)"
@@ -966,12 +1451,15 @@ class SimpleApp:
         self._set_status("Typing your words...", C_BLUE)
         try:
             pyautogui.write(text + " ", interval=0.01)
+            log_event("TYPE", "typed successfully at cursor")
             self._set_status("Done! Your words have been typed", C_GREEN)
         except Exception as e:
-            print(f"Type failed: {e}")
+            log_error("countdown_and_type", e)
+            log_event("TYPE", f"failed: {type(e).__name__}: {e}")
             self._set_status("Couldn't type there — use the COPY button instead", C_MUTED)
 
     def _on_copy(self):
+        log_event("BUTTON", "Copy Text clicked")
         text = self._get_text()
         if text:
             self.root.clipboard_clear()
@@ -979,6 +1467,7 @@ class SimpleApp:
             self._flash("Copied! You can now paste it anywhere", C_BLUE)
 
     def _on_read(self):
+        log_event("BUTTON", "Read Aloud clicked")
         text = self._get_text()
         if text:
             self.speaker.speak(text)
@@ -987,6 +1476,7 @@ class SimpleApp:
             self._flash("There is no text to read yet", C_MUTED)
 
     def _on_clear(self):
+        log_event("BUTTON", "Start Over clicked")
         self.speaker.stop()
         self.text.delete("1.0", "end")
         self._set_status("Press the green button and start talking", C_GREEN)
