@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.10.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -932,14 +932,16 @@ class Spinner(tk.Canvas):
 
 # ─── Settings window ──────────────────────────────────────────────────────────
 class SettingsWindow(tk.Toplevel):
-    def __init__(self, parent, cfg, on_save, first_run=False):
+    def __init__(self, parent, cfg, on_save, first_run=False, app=None):
         super().__init__(parent)
         self.title("Settings")
         self.configure(bg=C_BG)
         self.cfg = cfg
         self.on_save = on_save
+        self.app = app   # lets the size slider live-preview the floating widget
         self.transient(parent)
         self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
 
         # ── Size to fit the screen, same fix as the main window ──────────────
         self.update_idletasks()
@@ -963,7 +965,7 @@ class SettingsWindow(tk.Toplevel):
         btns = tk.Frame(outer, bg=C_BG)
         btns.pack(side="bottom", fill="x", pady=12)
         tk.Button(btns, text="Cancel", font=ui_font(11),
-                  command=self.destroy).pack(side="right", padx=10)
+                  command=self._cancel).pack(side="right", padx=10)
         tk.Button(btns, text="Save", font=ui_font(11, bold=True),
                   bg=C_GREEN, fg="white", padx=14, pady=4,
                   command=self._save).pack(side="right")
@@ -1130,12 +1132,23 @@ class SettingsWindow(tk.Toplevel):
         self.floating_size_lbl = tk.Label(size_row, text=f"{self.floating_size_var.get()} px",
                                           font=ui_font(10, bold=True), bg=C_BG, fg=C_BLUE)
         self.floating_size_lbl.pack(side="right")
-        floating_size_scale = tk.Scale(body, from_=110, to=200, orient="horizontal",
-                               variable=self.floating_size_var, bg=C_BG, fg=C_TEXT,
-                               troughcolor=C_BORDER, highlightthickness=0,
-                               showvalue=False, length=win_w-90,
-                               command=lambda v: self.floating_size_lbl.config(
-                                   text=f"{int(float(v))} px"))
+
+        def _on_size_drag(v):
+            n = int(float(v))
+            self.floating_size_lbl.config(text=f"{n} px")
+            # Live preview: resize the actual floating widget as the
+            # slider moves, not just after clicking Save.
+            if self.app is not None and self.app.floating is not None:
+                self.app.floating.apply_size(n)
+
+        floating_size_scale = tk.Scale(
+            body, from_=FloatingWidget.MIN_SIZE, to=FloatingWidget.MAX_SIZE,
+            orient="horizontal", variable=self.floating_size_var,
+            bg=C_BG, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
+            showvalue=False, length=win_w-90,
+            # A noticeably bigger, easier-to-grab handle and thicker groove.
+            sliderlength=px(34), width=px(22), sliderrelief="raised",
+            activebackground=C_BLUE, command=_on_size_drag)
         floating_size_scale.pack(anchor="w", padx=30, pady=(0, 10))
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
@@ -1160,6 +1173,8 @@ class SettingsWindow(tk.Toplevel):
                                variable=self.delay_var, bg=C_BG, fg=C_TEXT,
                                troughcolor=C_BORDER, highlightthickness=0,
                                showvalue=False, length=win_w-70,
+                               sliderlength=px(34), width=px(22), sliderrelief="raised",
+                               activebackground=C_BLUE,
                                command=lambda v: self.delay_value_lbl.config(
                                    text=f"{int(float(v))} sec"))
         delay_scale.pack(anchor="w", padx=30, pady=(0, 16))
@@ -1382,6 +1397,15 @@ class SettingsWindow(tk.Toplevel):
         self.master.destroy()
         os._exit(0)
 
+    def _cancel(self):
+        # If the size slider was dragged (live-previewing the floating
+        # widget) but the dialog is being cancelled, put the widget back
+        # to whatever size was last actually saved.
+        if self.app is not None and self.app.floating is not None:
+            saved_size = int(self.app.cfg.get("floating_size", 110))
+            self.app.floating.apply_size(saved_size)
+        self.destroy()
+
     def _save(self):
         self.cfg["groq_api_key"] = self.key_var.get().strip()
         self.cfg["show_copy"]  = self.copy_var.get()
@@ -1429,8 +1453,35 @@ class FloatingWidget(tk.Toplevel):
     including on the buttons themselves — and moving the mouse. A short
     movement threshold distinguishes "held and dragged" from "just
     clicked", so dragging never accidentally triggers Record or Close.
+
+    Size can change live while the Settings slider is being dragged, via
+    apply_size(), without needing to close and reopen the widget.
     """
-    DRAG_THRESHOLD = 4  # pixels of movement before a press counts as a drag
+    DRAG_THRESHOLD = 4    # pixels of movement before a press counts as a drag
+    MIN_SIZE = 50
+    MAX_SIZE = 200
+
+    def _compute_layout(self, logical_size):
+        """
+        Work out every dimension for a given logical size (50-200, DPI-
+        independent). The slider value is a size *choice*; px() converts it
+        to actual pixels for this specific display, so the same slider
+        setting looks the same physical size on any screen.
+        """
+        logical_size = max(self.MIN_SIZE, min(self.MAX_SIZE, logical_size))
+        size = px(logical_size)
+        close_size = max(px(28), int(size * 0.55))
+        pad = px(14)
+        gap = px(10)
+        text_w = max(px(110), int(size * 1.7))
+        # font_size stays a LOGICAL point size; ui_font() applies DPI
+        # scaling itself, so scaling it again here would make it too large.
+        font_size = max(9, round(logical_size * 0.1))
+        width = pad*2 + size + gap + close_size + gap + text_w
+        height = pad*2 + max(size, close_size)
+        return dict(logical_size=logical_size, size=size, close_size=close_size,
+                   pad=pad, gap=gap, text_w=text_w, font_size=font_size,
+                   width=width, height=height)
 
     def __init__(self, app):
         super().__init__(app.root)
@@ -1443,25 +1494,9 @@ class FloatingWidget(tk.Toplevel):
             pass
         self.configure(bg=C_BG)
 
-        # The slider value (110-200) is a "logical" size choice, independent
-        # of any particular screen's DPI. px() converts it to actual pixels
-        # for this specific display, so the same slider setting looks the
-        # same physical size everywhere, rather than a fixed pixel count
-        # that only looked right on one machine's scaling.
-        logical_size = int(app.cfg.get("floating_size", 110))
-        logical_size = max(110, min(200, logical_size))
-        size = px(logical_size)
-        close_size = max(px(50), int(size * 0.55))  # a real button, scaled to match
-        pad = px(14)
-        gap = px(10)
-        text_w = max(px(140), int(size * 1.7))
-        # Status text scales with the button size too, so nothing looks
-        # cramped or gets cut off at any size — font_size stays a LOGICAL
-        # point size here; ui_font() applies the DPI scaling itself, so
-        # scaling it again here would make it too large.
-        font_size = max(11, round(logical_size * 0.1))
-        width = pad*2 + size + gap + close_size + gap + text_w
-        height = pad*2 + max(size, close_size)
+        L = self._compute_layout(int(app.cfg.get("floating_size", 110)))
+        size, close_size, pad, gap, text_w = L["size"], L["close_size"], L["pad"], L["gap"], L["text_w"]
+        width, height = L["width"], L["height"]
 
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -1473,9 +1508,10 @@ class FloatingWidget(tk.Toplevel):
             y = screen_h - height - margin - 50  # sit above the taskbar
         self.geometry(f"{width}x{height}+{x}+{y}")
 
-        card = tk.Frame(self, bg=C_SURFACE, highlightbackground=C_BORDER,
+        self.card = tk.Frame(self, bg=C_SURFACE, highlightbackground=C_BORDER,
                         highlightthickness=1)
-        card.pack(fill="both", expand=True)
+        self.card.pack(fill="both", expand=True)
+        card = self.card
 
         self.record_btn = RoundButton(card, "record", "", C_GREEN, C_GREEN_H,
                                       self._on_record, size=size, bg=C_SURFACE,
@@ -1490,7 +1526,7 @@ class FloatingWidget(tk.Toplevel):
 
         self.status_var = tk.StringVar(value="Ready")
         self.status_lbl = tk.Label(card, textvariable=self.status_var,
-                                   font=ui_font(font_size, bold=True), bg=C_SURFACE,
+                                   font=ui_font(L["font_size"], bold=True), bg=C_SURFACE,
                                    fg=C_GREEN, wraplength=text_w-10, justify="left")
         self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
                               width=text_w, height=height)
@@ -1574,6 +1610,41 @@ class FloatingWidget(tk.Toplevel):
             self.record_btn.set(icon="record", colour=C_GREEN, hover=C_GREEN_H)
             self.record_btn.pulse_stop()
 
+    def apply_size(self, logical_size):
+        """
+        Resize everything in place — buttons, close button, status text,
+        the window itself — without destroying and rebuilding the widget.
+        Used for live preview while the Settings size slider is dragged,
+        and cheap enough to call on every slider tick.
+
+        The bottom-right corner stays anchored while resizing (the widget
+        grows toward the top-left), matching where it's docked by default,
+        so it can't drift off-screen as it gets bigger.
+        """
+        L = self._compute_layout(logical_size)
+        size, close_size = L["size"], L["close_size"]
+        pad, gap, text_w = L["pad"], L["gap"], L["text_w"]
+        width, height = L["width"], L["height"]
+
+        old_x, old_y = self.winfo_x(), self.winfo_y()
+        old_w = self.winfo_width() or width
+        old_h = self.winfo_height() or height
+        new_x = old_x + (old_w - width)
+        new_y = old_y + (old_h - height)
+        self.geometry(f"{width}x{height}+{new_x}+{new_y}")
+
+        self.record_btn.resize(size)
+        self.record_btn.place(x=pad, y=pad + (max(size, close_size)-size)//2)
+
+        self.close_btn.resize(close_size)
+        self.close_btn.place(x=pad + size + gap,
+                             y=pad + (max(size, close_size)-close_size)//2)
+
+        self.status_lbl.config(font=ui_font(L["font_size"], bold=True),
+                               wraplength=text_w-10)
+        self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
+                              width=text_w, height=height)
+
 
 class SimpleApp:
     def __init__(self, root):
@@ -1629,26 +1700,40 @@ class SimpleApp:
         # Top bar: wordmark left, compact-toggle + gear right
         top = tk.Frame(outer, bg=C_BG)
         top.pack(side="top", fill="x", padx=px(24), pady=(px(14), 0))
-        title = tk.Label(top, text="Voice to Text", font=ui_font(17, bold=True),
+
+        # Row 1: just the title, so it never has to compete for space
+        # with the control buttons and squeeze them out of view.
+        title_row = tk.Frame(top, bg=C_BG)
+        title_row.pack(side="top", fill="x")
+        title = tk.Label(title_row, text="Voice to Text", font=ui_font(17, bold=True),
                          bg=C_BG, fg=C_TEXT)
         title.pack(side="left")
 
-        gear = tk.Button(top, text="\u2699", font=ui_font(16), bd=0,
-                         bg=C_BG, fg=C_MUTED, activebackground=C_BG,
-                         activeforeground=C_TEXT,
-                         cursor="hand2", command=self._open_settings)
+        # Row 2: always its own row underneath the title, so shrinking the
+        # window never pushes these out of sight or hides them behind
+        # anything — they simply always have this row to themselves.
+        controls_row = tk.Frame(top, bg=C_BG)
+        controls_row.pack(side="top", fill="x", pady=(px(8), 0))
+
+        def _chip(parent, text, command):
+            """A small pill-style button — filled background and a border
+            so it reads clearly as a clickable control, not plain text."""
+            return tk.Button(parent, text=text, font=ui_font(9, bold=True),
+                             bd=1, relief="solid", cursor="hand2",
+                             padx=px(10), pady=px(4), command=command)
+
+        gear = _chip(controls_row, "\u2699 Settings", self._open_settings)
+        gear.config(bg=C_SURFACE, fg=C_TEXT, activebackground=C_BORDER,
+                   highlightbackground=C_BORDER)
         gear.pack(side="right")
 
-        self.compact_btn = tk.Button(top, text="Compact view", font=ui_font(9),
-                         bd=0, bg=C_BG, fg=C_MUTED, activebackground=C_BG,
-                         activeforeground=C_TEXT, cursor="hand2",
-                         command=self._toggle_compact)
-        self.compact_btn.pack(side="right", padx=(0, 14))
+        self.compact_btn = _chip(controls_row, "Compact view", self._toggle_compact)
+        self.compact_btn.config(bg=C_SURFACE, fg=C_TEXT, activebackground=C_BORDER,
+                               highlightbackground=C_BORDER)
+        self.compact_btn.pack(side="right", padx=(0, px(8)))
 
-        self.floating_toggle_btn = tk.Button(top, font=ui_font(9), bd=0,
-                         bg=C_BG, activebackground=C_BG, cursor="hand2",
-                         command=self._toggle_floating_button)
-        self.floating_toggle_btn.pack(side="right", padx=(0, 14))
+        self.floating_toggle_btn = _chip(controls_row, "", self._toggle_floating_button)
+        self.floating_toggle_btn.pack(side="right", padx=(0, px(8)))
         self._refresh_floating_toggle_btn()
 
         # Status row: spinner + message side by side
@@ -1724,9 +1809,14 @@ class SimpleApp:
 
     def _refresh_floating_toggle_btn(self):
         on = self.cfg.get("show_floating", True)
-        self.floating_toggle_btn.config(
-            text="Floating: On" if on else "Floating: Off",
-            fg=C_GREEN if on else C_MUTED)
+        if on:
+            self.floating_toggle_btn.config(
+                text="\u25cf Floating: On", fg="white", bg=C_GREEN,
+                activebackground=C_GREEN_H, highlightbackground=C_GREEN)
+        else:
+            self.floating_toggle_btn.config(
+                text="\u25cb Floating: Off", fg=C_TEXT, bg=C_SURFACE,
+                activebackground=C_BORDER, highlightbackground=C_BORDER)
 
     # ── Responsive layout ────────────────────────────────────────────────────
     def _on_window_configure(self, event):
@@ -1829,11 +1919,11 @@ class SimpleApp:
 
     def _open_settings(self):
         log_event("BUTTON", "Settings (gear) clicked")
-        SettingsWindow(self.root, self.cfg, on_save=self._after_settings)
+        SettingsWindow(self.root, self.cfg, on_save=self._after_settings, app=self)
 
     def _open_settings_first_run(self):
         log_event("APP", "first-run settings popup shown (no key set)")
-        SettingsWindow(self.root, self.cfg, on_save=self._after_settings, first_run=True)
+        SettingsWindow(self.root, self.cfg, on_save=self._after_settings, first_run=True, app=self)
 
     def _after_settings(self):
         log_event("SETTINGS", "saved — "
