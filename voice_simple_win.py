@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.13.0"
+APP_VERSION = "3.14.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -1167,36 +1167,11 @@ class SettingsWindow(tk.Toplevel):
                        variable=self.floating_var, bg=C_BG,
                        font=ui_font(11)).pack(anchor="w", padx=30, pady=(4, 2))
         tk.Label(body, text="You can also close it any time with its own X button, "
-                            "or drag it anywhere by pressing and holding.",
+                            "or drag it anywhere by pressing and holding. To "
+                            "change its size, use the slider under the buttons "
+                            "on the main screen.",
                  font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
-                 wraplength=win_w-90).pack(anchor="w", padx=30, pady=(0, 8))
-
-        size_row = tk.Frame(body, bg=C_BG)
-        size_row.pack(anchor="w", padx=30, pady=(0, 4), fill="x")
-        tk.Label(size_row, text="Button size:", font=ui_font(10),
-                bg=C_BG, fg=C_TEXT).pack(side="left")
-        self.floating_size_var = tk.IntVar(value=int(cfg.get("floating_size", 110)))
-        self.floating_size_lbl = tk.Label(size_row, text=f"{self.floating_size_var.get()} px",
-                                          font=ui_font(10, bold=True), bg=C_BG, fg=C_BLUE)
-        self.floating_size_lbl.pack(side="right")
-
-        def _on_size_drag(v):
-            n = int(float(v))
-            self.floating_size_lbl.config(text=f"{n} px")
-            # Live preview: resize the actual floating widget as the
-            # slider moves, not just after clicking Save.
-            if self.app is not None and self.app.floating is not None:
-                self.app.floating.apply_size(n)
-
-        floating_size_scale = tk.Scale(
-            body, from_=FloatingWidget.MIN_SIZE, to=FloatingWidget.MAX_SIZE,
-            orient="horizontal", variable=self.floating_size_var,
-            bg=C_BG, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
-            showvalue=False, length=win_w-90,
-            # A noticeably bigger, easier-to-grab handle and thicker groove.
-            sliderlength=px(34), width=px(22), sliderrelief="raised",
-            activebackground=C_BLUE, command=_on_size_drag)
-        floating_size_scale.pack(anchor="w", padx=30, pady=(0, 10))
+                 wraplength=win_w-90).pack(anchor="w", padx=30, pady=(0, 10))
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
@@ -1465,12 +1440,6 @@ class SettingsWindow(tk.Toplevel):
         os._exit(0)
 
     def _cancel(self):
-        # If the size slider was dragged (live-previewing the floating
-        # widget) but the dialog is being cancelled, put the widget back
-        # to whatever size was last actually saved.
-        if self.app is not None and self.app.floating is not None:
-            saved_size = int(self.app.cfg.get("floating_size", 110))
-            self.app.floating.apply_size(saved_size)
         self.destroy()
 
     def _save(self):
@@ -1481,7 +1450,6 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["auto_type"]  = self.autotype_var.get()
         self.cfg["type_delay"] = int(self.delay_var.get())
         self.cfg["show_floating"] = self.floating_var.get()
-        self.cfg["floating_size"] = int(self.floating_size_var.get())
         self.cfg["floating_choice_made"] = True
         save_config(self.cfg)
         self.on_save()
@@ -1602,6 +1570,14 @@ class FloatingWidget(tk.Toplevel):
         self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
                               width=text_w, height=height)
 
+        # Remembered so set_status() can work out how much text actually
+        # fits in the current box — a Label doesn't clip overflowing text
+        # the way a Canvas item can be made to, so the text itself needs
+        # to be kept short enough to fit rather than just wrapped.
+        self._text_w = text_w
+        self._label_height = height
+        self._font_size_logical = L["font_size"]
+
         # ── Drag handling (screen-coordinate based, with click/drag split) ────
         self._press_root = None
         self._press_winpos = None
@@ -1669,9 +1645,31 @@ class FloatingWidget(tk.Toplevel):
 
     # ── Mirrors of the main window's status updates ──────────────────────────
     def set_status(self, msg, colour):
-        short = msg if len(msg) <= 46 else msg[:43] + "..."
-        self.status_var.set(short)
+        # Remember the full, untruncated message so that if the widget
+        # grows again later, more of the real text can be shown rather
+        # than re-truncating an already-shortened string.
+        self._last_full_status = msg
+        self.status_var.set(self._fit_text(msg))
         self.status_lbl.config(fg=colour)
+
+    def _fit_text(self, msg):
+        """
+        Shorten msg so it fits within the current text box — the same
+        'never overflow' rule used for the button labels, adapted for a
+        Label (which doesn't clip overflowing text on its own the way a
+        Canvas item can be made to).
+        """
+        font_px = max(7, int(round(getattr(self, "_font_size_logical", 11) * DPI_SCALE)))
+        avg_char_w = max(1, font_px * 0.55)
+        text_w = getattr(self, "_text_w", 140)
+        height = getattr(self, "_label_height", 60)
+        chars_per_line = max(6, int(text_w / avg_char_w))
+        line_h = max(1, font_px * 1.3)
+        max_lines = max(1, int(height / line_h))
+        max_chars = chars_per_line * max_lines
+        if len(msg) <= max_chars:
+            return msg
+        return msg[:max(3, max_chars - 3)] + "..."
 
     def set_recording_state(self, recording):
         if recording:
@@ -1716,6 +1714,15 @@ class FloatingWidget(tk.Toplevel):
         self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
                               width=text_w, height=height)
 
+        self._text_w = text_w
+        self._label_height = height
+        self._font_size_logical = L["font_size"]
+        # Re-fit the FULL original message (not the already-truncated
+        # display text) to the new box size, so growing the widget back
+        # up can recover text that was previously cut off.
+        full_msg = getattr(self, "_last_full_status", self.status_var.get())
+        self.set_status(full_msg, self.status_lbl.cget("fg"))
+
 
 class SimpleApp:
     def __init__(self, root):
@@ -1736,6 +1743,8 @@ class SimpleApp:
         self._resize_job = None
         self._buttons = []         # list of (key, RoundButton)
         self.floating = None       # the FloatingWidget, if shown
+        self._preferred_btn_size = int(self.cfg.get("floating_size", 110))
+        self._size_save_job = None
 
         root.title("Voice to Text")
         root.configure(bg=C_BG)
@@ -1767,8 +1776,35 @@ class SimpleApp:
         outer.pack(fill="both", expand=True)
         self._outer = outer
 
-        # Button area — packed to the BOTTOM first, so it always keeps its
-        # spot even if the window is short. The text area fills what's left.
+        # Size slider — sits below the button row, at the very bottom of
+        # the window. Controls the button size here AND the floating
+        # popup's size together, with a live preview as it's dragged, so
+        # there's no need to dig into Settings just to resize things.
+        # Packed with side="bottom" BEFORE btn_frame, so it claims the
+        # true bottom of the window and the buttons sit just above it.
+        slider_area = tk.Frame(outer, bg=C_BG)
+        slider_area.pack(side="bottom", fill="x", padx=px(24), pady=(0, px(10)))
+
+        slider_label_row = tk.Frame(slider_area, bg=C_BG)
+        slider_label_row.pack(fill="x")
+        tk.Label(slider_label_row, text="Button & popup size:", font=ui_font(9),
+                bg=C_BG, fg=C_MUTED).pack(side="left")
+        self.size_value_lbl = tk.Label(slider_label_row, text=f"{self._preferred_btn_size} px",
+                                       font=ui_font(9, bold=True), bg=C_BG, fg=C_BLUE)
+        self.size_value_lbl.pack(side="right")
+
+        self.size_var = tk.IntVar(value=self._preferred_btn_size)
+        self.size_slider = tk.Scale(
+            slider_area, from_=FloatingWidget.MIN_SIZE, to=FloatingWidget.MAX_SIZE,
+            orient="horizontal", variable=self.size_var,
+            bg=C_BG, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
+            showvalue=False, sliderlength=px(30), width=px(18),
+            sliderrelief="raised", activebackground=C_BLUE,
+            command=self._on_size_slider)
+        self.size_slider.pack(fill="x", pady=(2, 0))
+
+        # Button area — packed to the BOTTOM (now sits just above the
+        # slider), so it always keeps its spot even if the window is short.
         self.btn_frame = tk.Frame(outer, bg=C_BG)
         self.btn_frame.pack(side="bottom", pady=px(14))
 
@@ -1903,6 +1939,30 @@ class SimpleApp:
             self.root.after_cancel(self._resize_job)
         self._resize_job = self.root.after(120, self._apply_responsive_size)
 
+    def _on_size_slider(self, v):
+        """Live preview: as the slider moves, resize both the main
+        window's buttons and the floating popup immediately, so both are
+        seen changing together in real time."""
+        n = int(float(v))
+        self._preferred_btn_size = n
+        self.size_value_lbl.config(text=f"{n} px")
+
+        self._apply_responsive_size()
+        if self.floating is not None:
+            self.floating.apply_size(n)
+
+        # Save to disk is debounced so dragging doesn't hammer the file
+        # with a write on every pixel of movement.
+        if self._size_save_job:
+            self.root.after_cancel(self._size_save_job)
+        self._size_save_job = self.root.after(250, lambda: self._persist_size(n))
+
+    def _persist_size(self, n):
+        self._size_save_job = None
+        self.cfg["floating_size"] = n
+        save_config(self.cfg)
+        log_event("SETTINGS", f"button/popup size set to {n}px (main page slider)")
+
     def _apply_responsive_size(self):
         self._resize_job = None
         if not self._buttons:
@@ -1937,7 +1997,7 @@ class SimpleApp:
         # buttons and text to overflow off the window on some screens.
         # Only an absolute tiny floor remains, purely so buttons can never
         # shrink to literally nothing.
-        fit_size = min(px(210), max_w, avail_h)
+        fit_size = min(px(self._preferred_btn_size), max_w, avail_h)
         new_size = int(max(px(40), fit_size))
         self._btn_size_current = new_size
 
