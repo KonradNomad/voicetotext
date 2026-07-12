@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.13.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -841,25 +841,38 @@ class RoundButton(tk.Canvas):
 
         self._rounded_rect(pad, pad, s-pad, s-pad, radius, fill=fill, outline="")
 
-        # Icon centered in the upper-middle, label below it — both as one
-        # visually balanced unit, vertically centered as a group within
-        # the button. A generous gap keeps the icon and label from looking
-        # squished together.
-        icon_r = s * 0.13
-        font_size = max(9, int(s * 0.082))
-        label_h = font_size * 2.3   # reserve room for up to 2 wrapped lines
-        gap = s * 0.16              # clear breathing room between icon and label
-        group_h = icon_r*2 + gap + label_h
-        top = s/2 - group_h/2
-        icon_cy = top + icon_r
-        label_cy = top + icon_r*2 + gap + label_h/2
+        # Icon sits in a fixed zone in the upper part of the button. The
+        # label is anchored to its TOP edge (not centered) at a fixed gap
+        # below the icon's bottom edge — so however many lines the label
+        # wraps into, it can only ever grow downward, never upward into
+        # the icon. That guarantees they can't overlap, regardless of how
+        # small the button gets or how the text happens to wrap.
+        icon_r = s * 0.15
+        icon_top_margin = s * 0.16
+        icon_cy = icon_top_margin + icon_r
+        icon_bottom = icon_cy + icon_r
+
+        font_size = max(8, int(s * 0.078))
+        gap = s * 0.10
+        label_top = icon_bottom + gap
+        label_bottom_limit = s - (s * 0.06)   # small margin above the button's bottom edge
 
         self._draw_icon(s/2, icon_cy, icon_r)
 
         fam = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
-        self.create_text(s/2, label_cy, text=self._label_text,
+        label_id = self.create_text(s/2, label_top, text=self._label_text,
                          font=(fam, font_size, "bold"), fill="white",
-                         justify="center", width=int(s*0.82))
+                         justify="center", width=int(s*0.86), anchor="n")
+
+        # If the label still doesn't fit below the icon (very small button,
+        # or an unusually long label), shrink the font just enough to fit
+        # rather than letting it run past the button's edge.
+        bbox = self.bbox(label_id)
+        if bbox and bbox[3] > label_bottom_limit and font_size > 7:
+            while bbox and bbox[3] > label_bottom_limit and font_size > 7:
+                font_size -= 1
+                self.itemconfig(label_id, font=(fam, font_size, "bold"))
+                bbox = self.bbox(label_id)
 
     def set(self, label=None, icon=None, colour=None, hover=None):
         if label is not None:  self._label_text = label
