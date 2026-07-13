@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.17.0"
+APP_VERSION = "3.18.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -303,6 +303,7 @@ DEFAULT_CONFIG = {
     "type_delay":        5,      # seconds to wait before typing (3-15)
     "show_floating":      True,   # persistent floating record button (on by default)
     "floating_choice_made": False, # becomes True once the user explicitly toggles it
+    "button_size":        110,    # main window buttons — independent of the popup
     "floating_size":      110,    # diameter of the floating record button
     "floating_x":         None,   # remembered position after dragging
     "floating_y":         None,
@@ -1963,8 +1964,9 @@ class SimpleApp:
         self._resize_job = None
         self._buttons = []         # list of (key, RoundButton)
         self.floating = None       # the FloatingWidget, if shown
-        self._preferred_btn_size = int(self.cfg.get("floating_size", 110))
-        self._size_save_job = None
+        self._preferred_btn_size = int(self.cfg.get("button_size", 110))
+        self._button_size_save_job = None
+        self._popup_size_save_job = None
 
         root.title("Voice to Text")
         root.configure(bg=C_BG)
@@ -1996,44 +1998,28 @@ class SimpleApp:
         outer.pack(fill="both", expand=True)
         self._outer = outer
 
-        # Size slider — sits below the button row, at the very bottom of
-        # the window. Controls the button size here AND the floating
-        # popup's size together, with a live preview as it's dragged, so
-        # there's no need to dig into Settings just to resize things.
-        # Packed with side="bottom" BEFORE btn_frame, so it claims the
+        # Two independent size sliders, side by side, below the button
+        # row at the very bottom of the window — one for the main
+        # window's buttons, one for the floating popup, so they can be
+        # set to different sizes rather than being tied together.
+        # Packed with side="bottom" BEFORE btn_frame, so this claims the
         # true bottom of the window and the buttons sit just above it.
-        #
-        # Given a distinct card look (background tint + border) rather
-        # than sitting flush with the page background, so it reads as an
-        # actual control rather than blending into the surroundings.
-        slider_outer = tk.Frame(outer, bg=C_BG)
-        slider_outer.pack(side="bottom", fill="x", padx=px(24), pady=(0, px(12)))
+        sliders_row = tk.Frame(outer, bg=C_BG)
+        sliders_row.pack(side="bottom", fill="x", padx=px(24), pady=(0, px(12)))
 
-        slider_area = tk.Frame(slider_outer, bg=C_SURFACE,
-                               highlightbackground=C_BORDER, highlightthickness=1)
-        slider_area.pack(fill="x")
+        self.button_size_var, self.size_value_lbl, self.button_size_slider = \
+            self._build_size_card(sliders_row, "Button size", self._preferred_btn_size,
+                                  self._on_button_size_slider, side="left",
+                                  pad=(0, px(6)))
 
-        slider_label_row = tk.Frame(slider_area, bg=C_SURFACE)
-        slider_label_row.pack(fill="x", padx=px(14), pady=(px(10), px(2)))
-        tk.Label(slider_label_row, text="Button & popup size", font=ui_font(11, bold=True),
-                bg=C_SURFACE, fg=C_TEXT).pack(side="left")
-        self.size_value_lbl = tk.Label(slider_label_row, text=f"{self._preferred_btn_size} px",
-                                       font=ui_font(11, bold=True), bg=C_BLUE, fg="white",
-                                       padx=px(8), pady=px(1))
-        self.size_value_lbl.pack(side="right")
-
-        self.size_var = tk.IntVar(value=self._preferred_btn_size)
-        self.size_slider = tk.Scale(
-            slider_area, from_=FloatingWidget.MIN_SIZE, to=FloatingWidget.MAX_SIZE,
-            orient="horizontal", variable=self.size_var,
-            bg=C_SURFACE, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
-            showvalue=False, sliderlength=px(38), width=px(26),
-            sliderrelief="raised", activebackground=C_BLUE, bd=0,
-            command=self._on_size_slider)
-        self.size_slider.pack(fill="x", padx=px(12), pady=(0, px(10)))
+        popup_initial = int(self.cfg.get("floating_size", 110))
+        self.popup_size_var, self.popup_size_value_lbl, self.popup_size_slider = \
+            self._build_size_card(sliders_row, "Popup size", popup_initial,
+                                  self._on_popup_size_slider, side="left",
+                                  pad=(px(6), 0))
 
         # Button area — packed to the BOTTOM (now sits just above the
-        # slider), so it always keeps its spot even if the window is short.
+        # sliders), so it always keeps its spot even if the window is short.
         self.btn_frame = tk.Frame(outer, bg=C_BG)
         self.btn_frame.pack(side="bottom", pady=px(14))
 
@@ -2202,29 +2188,79 @@ class SimpleApp:
             self.root.after_cancel(self._resize_job)
         self._resize_job = self.root.after(120, self._apply_responsive_size)
 
-    def _on_size_slider(self, v):
-        """Live preview: as the slider moves, resize both the main
-        window's buttons and the floating popup immediately, so both are
-        seen changing together in real time."""
+    def _build_size_card(self, parent, title, initial_value, on_change, side="left", pad=(0, 0)):
+        """
+        Builds one size-slider card (label + value badge + slider) and
+        returns (IntVar, value_label, slider) so the caller can reference
+        them later. Used twice — once for the button size, once for the
+        popup size — so the two controls look identical but work on
+        their own IntVars and callbacks, fully independent of each other.
+        """
+        card_outer = tk.Frame(parent, bg=C_BG)
+        card_outer.pack(side=side, fill="both", expand=True, padx=pad)
+
+        card = tk.Frame(card_outer, bg=C_SURFACE,
+                        highlightbackground=C_BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+
+        label_row = tk.Frame(card, bg=C_SURFACE)
+        label_row.pack(fill="x", padx=px(14), pady=(px(10), px(2)))
+        tk.Label(label_row, text=title, font=ui_font(11, bold=True),
+                bg=C_SURFACE, fg=C_TEXT).pack(side="left")
+        value_lbl = tk.Label(label_row, text=f"{initial_value} px",
+                             font=ui_font(11, bold=True), bg=C_BLUE, fg="white",
+                             padx=px(8), pady=px(1))
+        value_lbl.pack(side="right")
+
+        var = tk.IntVar(value=initial_value)
+        slider = tk.Scale(
+            card, from_=FloatingWidget.MIN_SIZE, to=FloatingWidget.MAX_SIZE,
+            orient="horizontal", variable=var,
+            bg=C_SURFACE, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
+            showvalue=False, sliderlength=px(34), width=px(24),
+            sliderrelief="raised", activebackground=C_BLUE, bd=0,
+            command=on_change)
+        slider.pack(fill="x", padx=px(12), pady=(0, px(10)))
+
+        return var, value_lbl, slider
+
+    def _on_button_size_slider(self, v):
+        """Live preview for the main window's buttons — independent of
+        the popup's own size slider."""
         n = int(float(v))
         self._preferred_btn_size = n
         self.size_value_lbl.config(text=f"{n} px")
-
         self._apply_responsive_size()
+
+        if self._button_size_save_job:
+            self.root.after_cancel(self._button_size_save_job)
+        self._button_size_save_job = self.root.after(
+            250, lambda: self._persist_button_size(n))
+
+    def _persist_button_size(self, n):
+        self._button_size_save_job = None
+        self.cfg["button_size"] = n
+        save_config(self.cfg)
+        log_event("SETTINGS", f"button size set to {n}px")
+
+    def _on_popup_size_slider(self, v):
+        """Live preview for the floating popup — independent of the main
+        window's button size slider."""
+        n = int(float(v))
+        self.popup_size_value_lbl.config(text=f"{n} px")
         if self.floating is not None:
             self.floating.apply_size(n)
 
-        # Save to disk is debounced so dragging doesn't hammer the file
-        # with a write on every pixel of movement.
-        if self._size_save_job:
-            self.root.after_cancel(self._size_save_job)
-        self._size_save_job = self.root.after(250, lambda: self._persist_size(n))
+        if self._popup_size_save_job:
+            self.root.after_cancel(self._popup_size_save_job)
+        self._popup_size_save_job = self.root.after(
+            250, lambda: self._persist_popup_size(n))
 
-    def _persist_size(self, n):
-        self._size_save_job = None
+    def _persist_popup_size(self, n):
+        self._popup_size_save_job = None
         self.cfg["floating_size"] = n
         save_config(self.cfg)
-        log_event("SETTINGS", f"button/popup size set to {n}px (main page slider)")
+        log_event("SETTINGS", f"popup size set to {n}px")
 
     def _apply_responsive_size(self):
         self._resize_job = None
