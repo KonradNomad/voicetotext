@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.14.0"
+APP_VERSION = "3.15.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -204,8 +204,16 @@ def safe_thread(fn):
 ACTIVITY_LOG = CONFIG_DIR / "activity_log.txt"
 _ACTIVITY_MAX_LINES = 800   # keep the file from growing forever
 
+# Updated whenever something meaningful happens (button clicks, recording,
+# etc.) — used by the auto-close-after-inactivity feature to know how long
+# the app has genuinely sat unused, not just idle time since launch.
+_last_activity_time = [time.time()]
+_ACTIVITY_CATEGORIES = {"BUTTON", "RECORD", "TRANSCRIBE", "CLEANUP", "TYPE", "MIC_TEST"}
+
 def log_event(category, message):
     """Append one line to the activity log: [HH:MM:SS] CATEGORY: message"""
+    if category in _ACTIVITY_CATEGORIES:
+        _last_activity_time[0] = time.time()
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         line = f"[{_dt.datetime.now().strftime('%H:%M:%S')}] {category}: {message}\n"
@@ -214,6 +222,9 @@ def log_event(category, message):
         _trim_activity_log()
     except Exception:
         pass  # logging must never crash the app
+
+def seconds_since_last_activity():
+    return time.time() - _last_activity_time[0]
 
 def _trim_activity_log():
     """Keep the activity log to a reasonable size by dropping old lines."""
@@ -297,6 +308,9 @@ DEFAULT_CONFIG = {
     "floating_y":         None,
     "speech_rate":       165,   # words per minute for read-aloud
     "scale_override":    None,  # manual correction if auto-detected DPI looks wrong
+    "auto_close_enabled": False,  # quit automatically after a period of no use
+    "auto_close_minutes": 3,      # how long to wait (2-5), only used if enabled
+    "auto_launch":       False,   # start automatically when Windows starts
 }
 
 def load_config():
@@ -823,14 +837,22 @@ class RoundButton(tk.Canvas):
         radius = max(10, s * self.RADIUS_FRAC)
 
         if self._pulse_on:
-            ring_pad = pad - 6 + (self._pulse_step % 3) * 2
-            ring_pad = max(2, ring_pad)
+            # A clearly visible "breathing" ring — cycles smoothly out and
+            # back in with both its distance from the button and its
+            # thickness changing, so it reads as an obvious "recording is
+            # happening" animation rather than the small 2px wobble this
+            # used to be (easy to miss, especially on the floating widget).
+            cycle = 10
+            t = (self._pulse_step % cycle) / cycle
+            phase = t*2 if t < 0.5 else (1-t)*2   # triangle wave: 0 -> 1 -> 0
+            ring_pad = max(1, pad - 4 - int(phase * 12))
+            ring_width = max(2, 2 + int(phase * 3))
             if self._show_label:
                 self._rounded_rect(ring_pad, ring_pad, s-ring_pad, s-ring_pad,
-                                   radius+6, fill="", outline=self._colour, width=3)
+                                   radius+8, fill="", outline=self._colour, width=ring_width)
             else:
                 self.create_oval(ring_pad, ring_pad, s-ring_pad, s-ring_pad,
-                                 fill="", outline=self._colour, width=3)
+                                 fill="", outline=self._colour, width=ring_width)
 
         if not self._show_label:
             # Icon-only mode (used by the floating widget): a true circle
@@ -874,6 +896,16 @@ class RoundButton(tk.Canvas):
                 self.itemconfig(label_id, font=(fam, font_size, "bold"))
                 bbox = self.bbox(label_id)
 
+        # Remembered so a group of buttons can be made uniform afterward —
+        # each one fits its OWN label at this size, but different labels
+        # ("COPY TEXT" vs "RECORD") can need different sizes to fit the
+        # same button, which looks inconsistent side by side. The caller
+        # can query this and force every button in the row to match the
+        # smallest one that was actually needed.
+        self._label_id = label_id
+        self._fitted_font_size = font_size
+        self._label_family = fam
+
     def set(self, label=None, icon=None, colour=None, hover=None):
         if label is not None:  self._label_text = label
         if icon is not None:   self._icon = icon
@@ -887,6 +919,26 @@ class RoundButton(tk.Canvas):
         self._size = new_size
         self.config(width=new_size, height=new_size)
         self._draw(self._colour)
+
+    def get_fitted_font_size(self):
+        """The font size this button settled on to fit its own label —
+        used to work out the smallest size needed across a row of
+        buttons, so they can all be made to match."""
+        return getattr(self, "_fitted_font_size", None)
+
+    def force_label_font(self, font_size):
+        """Override the label's font size directly (used to make a whole
+        row of buttons share the same, smaller-if-necessary size instead
+        of each fitting independently, which can look inconsistent when
+        labels are different lengths)."""
+        label_id = getattr(self, "_label_id", None)
+        fam = getattr(self, "_label_family", None)
+        if label_id is not None and fam:
+            try:
+                self.itemconfig(label_id, font=(fam, font_size, "bold"))
+                self._fitted_font_size = font_size
+            except Exception:
+                pass
 
     def pulse_start(self):
         if self._pulse_on:
@@ -903,7 +955,7 @@ class RoundButton(tk.Canvas):
             return
         self._pulse_step += 1
         self._draw(self._colour)
-        self.after(350, self._pulse)
+        self.after(120, self._pulse)
 
 
 # ─── Spinner (animated wheel) ─────────────────────────────────────────────────
@@ -1077,6 +1129,57 @@ class SettingsWindow(tk.Toplevel):
             b.pack(side="left", padx=(0, 6))
             self._scale_buttons[val] = b
         self._refresh_scale_buttons()
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
+        # ── Auto-close after inactivity ───────────────────────────────────────
+        tk.Label(body, text="Auto-Close", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="Close the app automatically after it hasn't been "
+                      "used for a while, so it doesn't keep running in "
+                      "the background unnecessarily.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-60).pack(anchor="w", padx=20)
+
+        self.autoclose_var = tk.BooleanVar(value=cfg.get("auto_close_enabled", False))
+        tk.Checkbutton(body, text="Close automatically when unused",
+                       variable=self.autoclose_var, bg=C_BG,
+                       font=ui_font(11)).pack(anchor="w", padx=30, pady=(6, 4))
+
+        close_time_row = tk.Frame(body, bg=C_BG)
+        close_time_row.pack(anchor="w", padx=30, pady=(0, 10))
+        tk.Label(close_time_row, text="After:", font=ui_font(9),
+                bg=C_BG, fg=C_MUTED).pack(side="left", padx=(0, 6))
+        self.autoclose_minutes_var = tk.StringVar(
+            value=str(int(cfg.get("auto_close_minutes", 3))))
+        self._autoclose_buttons = {}
+        for n in [2, 3, 4, 5]:
+            b = tk.Button(close_time_row, text=f"{n} min", font=ui_font(9, bold=True),
+                         bd=1, relief="solid", padx=px(8), pady=px(3),
+                         command=lambda v=n: self._pick_autoclose_minutes(v))
+            b.pack(side="left", padx=(0, 6))
+            self._autoclose_buttons[str(n)] = b
+        self._refresh_autoclose_buttons()
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
+
+        # ── Auto-launch on startup ────────────────────────────────────────────
+        tk.Label(body, text="Start With Windows", font=ui_font(12, bold=True),
+                 bg=C_BG, fg=C_TEXT).pack(anchor="w", padx=20)
+        tk.Label(body,
+                 text="Open Voice to Text automatically whenever this "
+                      "computer turns on, so it's always ready without "
+                      "needing to find and click the icon.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-60).pack(anchor="w", padx=20)
+
+        self.autolaunch_var = tk.BooleanVar(
+            value=cfg.get("auto_launch", False) or get_autostart_state())
+        tk.Checkbutton(body, text="Start automatically when the computer turns on",
+                       variable=self.autolaunch_var, bg=C_BG,
+                       font=ui_font(11), command=self._toggle_autolaunch
+                       ).pack(anchor="w", padx=30, pady=(6, 10))
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", padx=20, pady=10)
 
@@ -1287,6 +1390,28 @@ class SettingsWindow(tk.Toplevel):
                 btn.config(bg=C_SURFACE, fg=C_TEXT, activebackground=C_BORDER,
                           highlightbackground=C_BORDER)
 
+    def _pick_autoclose_minutes(self, n):
+        self.autoclose_minutes_var.set(str(n))
+        self._refresh_autoclose_buttons()
+
+    def _refresh_autoclose_buttons(self):
+        current = self.autoclose_minutes_var.get()
+        for val, btn in self._autoclose_buttons.items():
+            if val == current:
+                btn.config(bg=C_BLUE, fg="white", activebackground=C_BLUE_H,
+                          highlightbackground=C_BLUE)
+            else:
+                btn.config(bg=C_SURFACE, fg=C_TEXT, activebackground=C_BORDER,
+                          highlightbackground=C_BORDER)
+
+    def _toggle_autolaunch(self):
+        enabled = self.autolaunch_var.get()
+        ok = set_autostart(enabled)
+        if not ok:
+            # Couldn't write to the registry for some reason — reflect
+            # reality in the checkbox rather than claim it worked.
+            self.autolaunch_var.set(get_autostart_state())
+
     def _open_mic_privacy(self):
         try:
             os.startfile("ms-settings:privacy-microphone")
@@ -1451,6 +1576,9 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["type_delay"] = int(self.delay_var.get())
         self.cfg["show_floating"] = self.floating_var.get()
         self.cfg["floating_choice_made"] = True
+        self.cfg["auto_close_enabled"] = self.autoclose_var.get()
+        self.cfg["auto_close_minutes"] = int(self.autoclose_minutes_var.get())
+        self.cfg["auto_launch"] = self.autolaunch_var.get()
         save_config(self.cfg)
         self.on_save()
         self.destroy()
@@ -1495,6 +1623,16 @@ class FloatingWidget(tk.Toplevel):
     DRAG_THRESHOLD = 4    # pixels of movement before a press counts as a drag
     MIN_SIZE = 50
     MAX_SIZE = 200
+
+    def _clamp_to_screen(self, x, y, width, height):
+        """Keep the widget fully within the visible screen — used at
+        startup, after resizing, and while dragging, so it can never end
+        up partly hidden off the edge."""
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = max(0, min(x, screen_w - width))
+        y = max(0, min(y, screen_h - height))
+        return x, y
 
     def _compute_layout(self, logical_size):
         """
@@ -1545,6 +1683,11 @@ class FloatingWidget(tk.Toplevel):
         if x is None or y is None:
             x = screen_w - width - margin
             y = screen_h - height - margin - 50  # sit above the taskbar
+        # A saved position combined with a size that's since grown (e.g.
+        # the size slider was used, or the app restarted with a larger
+        # saved size) could otherwise sit partly off-screen — keep it
+        # fully visible regardless.
+        x, y = self._clamp_to_screen(x, y, width, height)
         self.geometry(f"{width}x{height}+{x}+{y}")
 
         self.card = tk.Frame(self, bg=C_SURFACE, highlightbackground=C_BORDER,
@@ -1606,6 +1749,9 @@ class FloatingWidget(tk.Toplevel):
         if self._dragged:
             new_x = self._press_winpos[0] + dx
             new_y = self._press_winpos[1] + dy
+            w = self.winfo_width()
+            h = self.winfo_height()
+            new_x, new_y = self._clamp_to_screen(new_x, new_y, w, h)
             self.geometry(f"+{new_x}+{new_y}")
 
     def _on_release(self, event):
@@ -1700,6 +1846,11 @@ class FloatingWidget(tk.Toplevel):
         old_h = self.winfo_height() or height
         new_x = old_x + (old_w - width)
         new_y = old_y + (old_h - height)
+        # Growing while anchored to the bottom-right corner keeps it on
+        # screen in the normal case, but this is a final safety net for
+        # anything unusual (multi-monitor setups, a widget dragged right
+        # up against an edge, etc.) — never let it end up partly hidden.
+        new_x, new_y = self._clamp_to_screen(new_x, new_y, width, height)
         self.geometry(f"{width}x{height}+{new_x}+{new_y}")
 
         self.record_btn.resize(size)
@@ -1882,6 +2033,11 @@ class SimpleApp:
         if self.cfg.get("show_floating"):
             self.root.after(30, self._open_floating_widget)
 
+        # Auto-close after inactivity: checked periodically rather than
+        # with one long timer, so a change to the setting takes effect on
+        # the very next check instead of needing a restart.
+        self.root.after(15000, self._check_auto_close)
+
     # ── Floating widget ──────────────────────────────────────────────────────
     def _open_floating_widget(self):
         if self.floating is not None:
@@ -1928,6 +2084,35 @@ class SimpleApp:
             self.floating_toggle_btn.config(
                 text="\u25cb Floating: Off", fg=C_TEXT, bg=C_SURFACE,
                 activebackground=C_BORDER, highlightbackground=C_BORDER)
+
+    # ── Auto-close after inactivity ───────────────────────────────────────────
+    def _check_auto_close(self):
+        try:
+            if self.cfg.get("auto_close_enabled") and not self._recording and not self._processing:
+                minutes = max(2, min(5, int(self.cfg.get("auto_close_minutes", 3))))
+                idle = seconds_since_last_activity()
+                if idle >= minutes * 60:
+                    log_event("APP", f"auto-closing after {minutes} min of no use")
+                    self._quit_app()
+                    return
+        except Exception as e:
+            log_error("check_auto_close", e)
+        # Check again in 15 seconds — frequent enough to close promptly
+        # once the limit is reached, cheap enough to not matter.
+        self.root.after(15000, self._check_auto_close)
+
+    def _quit_app(self):
+        try:
+            if self.floating is not None:
+                self.floating.destroy()
+        except Exception:
+            pass
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
 
     # ── Responsive layout ────────────────────────────────────────────────────
     def _on_window_configure(self, event):
@@ -2003,6 +2188,18 @@ class SimpleApp:
 
         for _, btn in self._buttons:
             btn.resize(new_size)
+
+        # Each button independently shrinks its own label to fit ("COPY
+        # TEXT" needs a smaller font than "RECORD" to fit the same button
+        # width), which looks inconsistent side by side. Even them all out
+        # by using the smallest size any button actually needed, applied
+        # to every button in the row.
+        fitted = [btn.get_fitted_font_size() for _, btn in self._buttons]
+        fitted = [f for f in fitted if f]
+        if fitted:
+            uniform_size = min(fitted)
+            for _, btn in self._buttons:
+                btn.force_label_font(uniform_size)
 
         wrap = max(200, min(620, win_w - 80))
 
@@ -2487,6 +2684,55 @@ def ensure_desktop_shortcut():
         marker.write_text("done")
     except Exception:
         pass
+
+
+def _autostart_target():
+    """The path to register for Windows startup — the .exe itself if
+    running as a built app, otherwise this script run via pythonw (no
+    console window) for testing."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    interpreter = str(pythonw) if pythonw.exists() else sys.executable
+    script = os.path.abspath(__file__)
+    return f'"{interpreter}" "{script}"'
+
+def set_autostart(enabled):
+    """Turn 'start automatically when Windows starts' on or off, via the
+    standard per-user registry Run key — no admin rights needed, and it's
+    easy to toggle from Settings without touching the Startup folder."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, "VoiceToText", 0, winreg.REG_SZ, _autostart_target())
+            else:
+                try:
+                    winreg.DeleteValue(key, "VoiceToText")
+                except FileNotFoundError:
+                    pass
+        log_event("APP", f"auto-launch on startup set to {enabled}")
+        return True
+    except Exception as e:
+        log_error("set_autostart", e)
+        return False
+
+def get_autostart_state():
+    """Check what Windows actually has registered, in case it was changed
+    outside the app (e.g. via Task Manager's Startup tab)."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, "VoiceToText")
+            return True
+    except Exception:
+        return False
 
 
 def main():
