@@ -19,7 +19,7 @@ Runs on Windows and Linux. Build a standalone .exe with PyInstaller
 (see the note at the bottom of this file).
 """
 
-APP_VERSION = "3.15.0"
+APP_VERSION = "3.17.0"
 
 import os, sys, wave, tempfile, threading, subprocess, time, json, re, struct
 from pathlib import Path
@@ -306,6 +306,7 @@ DEFAULT_CONFIG = {
     "floating_size":      110,    # diameter of the floating record button
     "floating_x":         None,   # remembered position after dragging
     "floating_y":         None,
+    "floating_show_text": True,   # status text next to the buttons; off = buttons only
     "speech_rate":       165,   # words per minute for read-aloud
     "scale_override":    None,  # manual correction if auto-detected DPI looks wrong
     "auto_close_enabled": False,  # quit automatically after a period of no use
@@ -1013,10 +1014,10 @@ class SettingsWindow(tk.Toplevel):
         self.update_idletasks()
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        win_w = min(px(480), screen_w - px(80))
-        win_h = min(px(600), screen_h - px(100))
-        win_w = max(win_w, px(360))
-        win_h = max(win_h, px(420))
+        win_w = min(px(600), screen_w - px(60))
+        win_h = min(px(640), screen_h - px(100))
+        win_w = max(win_w, px(440))
+        win_h = max(win_h, px(440))
         # Safety net: never let the floor above push the window past the
         # actual screen size, even if DPI scaling was detected incorrectly.
         win_w = min(win_w, screen_w - 20)
@@ -1273,6 +1274,15 @@ class SettingsWindow(tk.Toplevel):
                             "or drag it anywhere by pressing and holding. To "
                             "change its size, use the slider under the buttons "
                             "on the main screen.",
+                 font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
+                 wraplength=win_w-90).pack(anchor="w", padx=30, pady=(0, 8))
+
+        self.floating_text_var = tk.BooleanVar(value=cfg.get("floating_show_text", True))
+        tk.Checkbutton(body, text="Show status text next to the popup buttons",
+                       variable=self.floating_text_var, bg=C_BG,
+                       font=ui_font(11)).pack(anchor="w", padx=30, pady=(0, 2))
+        tk.Label(body, text="Turn this off to keep just the buttons, with no "
+                            "text — a smaller, simpler popup.",
                  font=ui_font(9), bg=C_BG, fg=C_MUTED, justify="left",
                  wraplength=win_w-90).pack(anchor="w", padx=30, pady=(0, 10))
 
@@ -1575,6 +1585,7 @@ class SettingsWindow(tk.Toplevel):
         self.cfg["auto_type"]  = self.autotype_var.get()
         self.cfg["type_delay"] = int(self.delay_var.get())
         self.cfg["show_floating"] = self.floating_var.get()
+        self.cfg["floating_show_text"] = self.floating_text_var.get()
         self.cfg["floating_choice_made"] = True
         self.cfg["auto_close_enabled"] = self.autoclose_var.get()
         self.cfg["auto_close_minutes"] = int(self.autoclose_minutes_var.get())
@@ -1640,6 +1651,11 @@ class FloatingWidget(tk.Toplevel):
         independent). The slider value is a size *choice*; px() converts it
         to actual pixels for this specific display, so the same slider
         setting looks the same physical size on any screen.
+
+        Layout left to right: [countdown] [record] [close] [status text].
+        The countdown zone is always reserved (blank until a countdown is
+        actually running); the status text is only included if turned on
+        in Settings — with it off, the popup is just the two buttons.
         """
         logical_size = max(self.MIN_SIZE, min(self.MAX_SIZE, logical_size))
         size = px(logical_size)
@@ -1648,17 +1664,20 @@ class FloatingWidget(tk.Toplevel):
         # down with a tiny record button made it too small to see or
         # click reliably.
         close_size = max(px(36), int(size * 0.55))
+        countdown_size = max(px(30), int(size * 0.5))
         pad = px(14)
         gap = px(10)
-        text_w = max(px(110), int(size * 1.7))
+        show_text = self.app.cfg.get("floating_show_text", True)
+        text_w = max(px(110), int(size * 1.7)) if show_text else 0
         # font_size stays a LOGICAL point size; ui_font() applies DPI
         # scaling itself, so scaling it again here would make it too large.
         font_size = max(9, round(logical_size * 0.1))
-        width = pad*2 + size + gap + close_size + gap + text_w
-        height = pad*2 + max(size, close_size)
+        width = (pad*2 + countdown_size + gap + size + gap + close_size
+                 + (gap + text_w if show_text else 0))
+        height = pad*2 + max(size, close_size, countdown_size)
         return dict(logical_size=logical_size, size=size, close_size=close_size,
-                   pad=pad, gap=gap, text_w=text_w, font_size=font_size,
-                   width=width, height=height)
+                   countdown_size=countdown_size, pad=pad, gap=gap, text_w=text_w,
+                   font_size=font_size, width=width, height=height, show_text=show_text)
 
     def __init__(self, app):
         super().__init__(app.root)
@@ -1672,8 +1691,9 @@ class FloatingWidget(tk.Toplevel):
         self.configure(bg=C_BG)
 
         L = self._compute_layout(int(app.cfg.get("floating_size", 110)))
-        size, close_size, pad, gap, text_w = L["size"], L["close_size"], L["pad"], L["gap"], L["text_w"]
-        width, height = L["width"], L["height"]
+        size, close_size = L["size"], L["close_size"]
+        countdown_size, pad, gap, text_w = L["countdown_size"], L["pad"], L["gap"], L["text_w"]
+        width, height, show_text = L["width"], L["height"], L["show_text"]
 
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -1695,31 +1715,40 @@ class FloatingWidget(tk.Toplevel):
         self.card.pack(fill="both", expand=True)
         card = self.card
 
+        row_h = max(size, close_size, countdown_size)
+
+        # Countdown zone — always reserved on the left of the record
+        # button, blank until a countdown is actually running (see
+        # show_countdown()/clear_countdown()).
+        self._countdown_size = countdown_size
+        self.countdown_canvas = tk.Canvas(card, width=countdown_size, height=countdown_size,
+                                          bg=C_SURFACE, highlightthickness=0)
+        self.countdown_canvas.place(x=pad, y=pad + (row_h-countdown_size)//2)
+
         self.record_btn = RoundButton(card, "record", "", C_GREEN, C_GREEN_H,
                                       self._on_record, size=size, bg=C_SURFACE,
                                       show_label=False, bind_click=False)
-        self.record_btn.place(x=pad, y=pad + (max(size, close_size)-size)//2)
+        self.record_btn.place(x=pad + countdown_size + gap, y=pad + (row_h-size)//2)
 
         self.close_btn = RoundButton(card, "close", "", C_GREY, C_RED,
                                      self._close, size=close_size, bg=C_SURFACE,
                                      show_label=False, bind_click=False)
-        self.close_btn.place(x=pad + size + gap,
-                             y=pad + (max(size, close_size)-close_size)//2)
+        self.close_btn.place(x=pad + countdown_size + gap + size + gap,
+                             y=pad + (row_h-close_size)//2)
 
-        self.status_var = tk.StringVar(value="Ready")
-        self.status_lbl = tk.Label(card, textvariable=self.status_var,
-                                   font=ui_font(L["font_size"], bold=True), bg=C_SURFACE,
-                                   fg=C_GREEN, wraplength=text_w-10, justify="left")
-        self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
-                              width=text_w, height=height)
-
-        # Remembered so set_status() can work out how much text actually
-        # fits in the current box — a Label doesn't clip overflowing text
-        # the way a Canvas item can be made to, so the text itself needs
-        # to be kept short enough to fit rather than just wrapped.
         self._text_w = text_w
         self._label_height = height
         self._font_size_logical = L["font_size"]
+        self.status_lbl = None
+        if show_text:
+            self.status_var = tk.StringVar(value="Ready")
+            self.status_lbl = tk.Label(card, textvariable=self.status_var,
+                                       font=ui_font(L["font_size"], bold=True), bg=C_SURFACE,
+                                       fg=C_GREEN, wraplength=text_w-10, justify="left")
+            self.status_lbl.place(x=pad + countdown_size + gap + size + gap + close_size + gap,
+                                  y=0, width=text_w, height=height)
+        else:
+            self.status_var = tk.StringVar(value="Ready")  # kept for compatibility, just unused visually
 
         # ── Drag handling (screen-coordinate based, with click/drag split) ────
         self._press_root = None
@@ -1727,10 +1756,36 @@ class FloatingWidget(tk.Toplevel):
         self._dragged = False
         self._press_widget = None
 
-        for w in (card, self.record_btn, self.close_btn, self.status_lbl):
+        drag_targets = [card, self.record_btn, self.close_btn]
+        if self.status_lbl is not None:
+            drag_targets.append(self.status_lbl)
+        for w in drag_targets:
             w.bind("<ButtonPress-1>", self._on_press)
             w.bind("<B1-Motion>", self._on_motion)
             w.bind("<ButtonRelease-1>", self._on_release)
+
+    # ── Countdown indicator (left of the record button) ──────────────────────
+    def show_countdown(self, n):
+        """Show a number in the countdown circle — used during the pause
+        before auto-typing, so there's a clear visual cue right on the
+        popup for how long is left to click into the target window."""
+        try:
+            c = self.countdown_canvas
+            s = self._countdown_size
+            c.delete("all")
+            c.create_oval(2, 2, s-2, s-2, fill=C_BLUE, outline="")
+            fam = "Segoe UI" if sys.platform.startswith("win") else "Helvetica"
+            font_sz = max(9, int(s * 0.42))
+            c.create_text(s/2, s/2, text=str(n), fill="white",
+                          font=(fam, font_sz, "bold"))
+        except Exception:
+            pass
+
+    def clear_countdown(self):
+        try:
+            self.countdown_canvas.delete("all")
+        except Exception:
+            pass
 
     # ── Drag / click handling ─────────────────────────────────────────────────
     def _on_press(self, event):
@@ -1795,6 +1850,8 @@ class FloatingWidget(tk.Toplevel):
         # grows again later, more of the real text can be shown rather
         # than re-truncating an already-shortened string.
         self._last_full_status = msg
+        if self.status_lbl is None:
+            return   # text turned off in Settings — nothing to update
         self.status_var.set(self._fit_text(msg))
         self.status_lbl.config(fg=colour)
 
@@ -1827,10 +1884,11 @@ class FloatingWidget(tk.Toplevel):
 
     def apply_size(self, logical_size):
         """
-        Resize everything in place — buttons, close button, status text,
-        the window itself — without destroying and rebuilding the widget.
-        Used for live preview while the Settings size slider is dragged,
-        and cheap enough to call on every slider tick.
+        Resize everything in place — buttons, close button, countdown
+        zone, status text (if shown), the window itself — without
+        destroying and rebuilding the widget. Used for live preview while
+        the size slider is dragged, and cheap enough to call on every
+        slider tick.
 
         The bottom-right corner stays anchored while resizing (the widget
         grows toward the top-left), matching where it's docked by default,
@@ -1838,8 +1896,8 @@ class FloatingWidget(tk.Toplevel):
         """
         L = self._compute_layout(logical_size)
         size, close_size = L["size"], L["close_size"]
-        pad, gap, text_w = L["pad"], L["gap"], L["text_w"]
-        width, height = L["width"], L["height"]
+        countdown_size, pad, gap, text_w = L["countdown_size"], L["pad"], L["gap"], L["text_w"]
+        width, height, show_text = L["width"], L["height"], L["show_text"]
 
         old_x, old_y = self.winfo_x(), self.winfo_y()
         old_w = self.winfo_width() or width
@@ -1853,26 +1911,37 @@ class FloatingWidget(tk.Toplevel):
         new_x, new_y = self._clamp_to_screen(new_x, new_y, width, height)
         self.geometry(f"{width}x{height}+{new_x}+{new_y}")
 
+        row_h = max(size, close_size, countdown_size)
+        self._countdown_size = countdown_size
+        self.countdown_canvas.config(width=countdown_size, height=countdown_size)
+        self.countdown_canvas.place(x=pad, y=pad + (row_h-countdown_size)//2)
+
         self.record_btn.resize(size)
-        self.record_btn.place(x=pad, y=pad + (max(size, close_size)-size)//2)
+        self.record_btn.place(x=pad + countdown_size + gap, y=pad + (row_h-size)//2)
 
         self.close_btn.resize(close_size)
-        self.close_btn.place(x=pad + size + gap,
-                             y=pad + (max(size, close_size)-close_size)//2)
-
-        self.status_lbl.config(font=ui_font(L["font_size"], bold=True),
-                               wraplength=text_w-10)
-        self.status_lbl.place(x=pad + size + gap + close_size + gap, y=0,
-                              width=text_w, height=height)
+        self.close_btn.place(x=pad + countdown_size + gap + size + gap,
+                             y=pad + (row_h-close_size)//2)
 
         self._text_w = text_w
         self._label_height = height
         self._font_size_logical = L["font_size"]
-        # Re-fit the FULL original message (not the already-truncated
-        # display text) to the new box size, so growing the widget back
-        # up can recover text that was previously cut off.
-        full_msg = getattr(self, "_last_full_status", self.status_var.get())
-        self.set_status(full_msg, self.status_lbl.cget("fg"))
+
+        if show_text and self.status_lbl is not None:
+            self.status_lbl.config(font=ui_font(L["font_size"], bold=True),
+                                   wraplength=text_w-10)
+            self.status_lbl.place(
+                x=pad + countdown_size + gap + size + gap + close_size + gap,
+                y=0, width=text_w, height=height)
+            # Re-fit the FULL original message (not the already-truncated
+            # display text) to the new box size, so growing the widget
+            # back up can recover text that was previously cut off.
+            full_msg = getattr(self, "_last_full_status", self.status_var.get())
+            self.set_status(full_msg, self.status_lbl.cget("fg"))
+        # Note: turning the text on/off requires a full rebuild (a Label
+        # can't be cleanly added/removed via place() alone) — that's
+        # handled by closing and reopening the widget when the Settings
+        # checkbox changes, not by this live-resize method.
 
 
 class SimpleApp:
@@ -1933,26 +2002,35 @@ class SimpleApp:
         # there's no need to dig into Settings just to resize things.
         # Packed with side="bottom" BEFORE btn_frame, so it claims the
         # true bottom of the window and the buttons sit just above it.
-        slider_area = tk.Frame(outer, bg=C_BG)
-        slider_area.pack(side="bottom", fill="x", padx=px(24), pady=(0, px(10)))
+        #
+        # Given a distinct card look (background tint + border) rather
+        # than sitting flush with the page background, so it reads as an
+        # actual control rather than blending into the surroundings.
+        slider_outer = tk.Frame(outer, bg=C_BG)
+        slider_outer.pack(side="bottom", fill="x", padx=px(24), pady=(0, px(12)))
 
-        slider_label_row = tk.Frame(slider_area, bg=C_BG)
-        slider_label_row.pack(fill="x")
-        tk.Label(slider_label_row, text="Button & popup size:", font=ui_font(9),
-                bg=C_BG, fg=C_MUTED).pack(side="left")
+        slider_area = tk.Frame(slider_outer, bg=C_SURFACE,
+                               highlightbackground=C_BORDER, highlightthickness=1)
+        slider_area.pack(fill="x")
+
+        slider_label_row = tk.Frame(slider_area, bg=C_SURFACE)
+        slider_label_row.pack(fill="x", padx=px(14), pady=(px(10), px(2)))
+        tk.Label(slider_label_row, text="Button & popup size", font=ui_font(11, bold=True),
+                bg=C_SURFACE, fg=C_TEXT).pack(side="left")
         self.size_value_lbl = tk.Label(slider_label_row, text=f"{self._preferred_btn_size} px",
-                                       font=ui_font(9, bold=True), bg=C_BG, fg=C_BLUE)
+                                       font=ui_font(11, bold=True), bg=C_BLUE, fg="white",
+                                       padx=px(8), pady=px(1))
         self.size_value_lbl.pack(side="right")
 
         self.size_var = tk.IntVar(value=self._preferred_btn_size)
         self.size_slider = tk.Scale(
             slider_area, from_=FloatingWidget.MIN_SIZE, to=FloatingWidget.MAX_SIZE,
             orient="horizontal", variable=self.size_var,
-            bg=C_BG, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
-            showvalue=False, sliderlength=px(30), width=px(18),
-            sliderrelief="raised", activebackground=C_BLUE,
+            bg=C_SURFACE, fg=C_TEXT, troughcolor=C_BORDER, highlightthickness=0,
+            showvalue=False, sliderlength=px(38), width=px(26),
+            sliderrelief="raised", activebackground=C_BLUE, bd=0,
             command=self._on_size_slider)
-        self.size_slider.pack(fill="x", pady=(2, 0))
+        self.size_slider.pack(fill="x", padx=px(12), pady=(0, px(10)))
 
         # Button area — packed to the BOTTOM (now sits just above the
         # slider), so it always keeps its spot even if the window is short.
@@ -2502,14 +2580,21 @@ class SimpleApp:
 
     def _countdown_and_type(self, text):
         """Countdown (configurable, 3-15s) so the user can click where the
-        words should go, then the words get typed/pasted at the cursor."""
+        words should go, then the words get typed/pasted at the cursor.
+        Also shown as a number in the floating popup's countdown circle,
+        to the left of the record button, so there's a clear visual cue
+        right on the popup itself."""
         delay = int(self.cfg.get("type_delay", 5))
         delay = max(3, min(15, delay))
         for remaining in range(delay, 0, -1):
             self._set_status(
                 f"Click where the words should go...  typing in {remaining}",
                 C_BLUE)
+            if self.floating is not None:
+                self.floating.show_countdown(remaining)
             time.sleep(1)
+        if self.floating is not None:
+            self.floating.clear_countdown()
         self._set_status("Typing your words...", C_BLUE)
         self._type_at_cursor(text + " ")
 
